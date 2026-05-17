@@ -2,7 +2,20 @@ export { createArtifactAutoIndexHook, parseLedger } from "./artifact-auto-index"
 export { type AutoCompactConfig, createAutoCompactHook } from "./auto-compact";
 export { createCommentCheckerHook } from "./comment-checker";
 export { ConstraintViolationError, createConstraintReviewerHook } from "./constraint-reviewer";
+export {
+  type CanReadOptions,
+  type CanReadResult,
+  type ContextBudgetConfig,
+  type ContextBudgetHooks,
+  createContextBudgetHook,
+  type FileCostEstimate,
+  type ReadCostEstimate,
+} from "./context-budget";
 export { createContextInjectorHook } from "./context-injector";
+export {
+  type ContextPinnerHooks,
+  createContextPinnerHook,
+} from "./context-pinner";
 export { type ContextWindowMonitorConfig, createContextWindowMonitorHook } from "./context-window-monitor";
 export {
   clearSession,
@@ -34,5 +47,9 @@ export {
   type LedgerInfo,
 } from "./ledger-loader";
 export { createMindmodelInjectorHook } from "./mindmodel-injector";
+export {
+  createReadGuardHook,
+  type ReadGuardHooks,
+} from "./read-guard";
 export { createSessionRecoveryHook } from "./session-recovery";
 export { createTokenAwareTruncationHook } from "./token-aware-truncation";

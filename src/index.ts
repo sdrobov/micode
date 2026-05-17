@@ -1,20 +1,24 @@
-import type { Plugin } from "@opencode-ai/plugin";
+import type { Plugin, PluginInput } from "@opencode-ai/plugin";
 import type { McpLocalConfig } from "@opencode-ai/sdk";
-
 import { agents, PRIMARY_AGENT_NAME } from "@/agents";
+import type { MicodeConfig } from "@/config-loader";
 import { loadMicodeConfig, loadModelContextLimits, mergeAgentConfigs } from "@/config-loader";
+import { isLocalLLMProvider } from "@/config-schemas";
 import {
   createArtifactAutoIndexHook,
   createAutoCompactHook,
   createCommentCheckerHook,
   createConstraintReviewerHook,
+  createContextBudgetHook,
   createContextInjectorHook,
+  createContextPinnerHook,
   createContextWindowMonitorHook,
   createFetchTrackerHook,
   createFileOpsTrackerHook,
   createFragmentInjectorHook,
   createLedgerLoaderHook,
   createMindmodelInjectorHook,
+  createReadGuardHook,
   createSessionRecoveryHook,
   createTokenAwareTruncationHook,
   getFileOps,
@@ -28,6 +32,7 @@ import {
   checkAstGrepAvailable,
   checkBtcaAvailable,
   createBatchReadTool,
+  createCheckContextBudgetTool,
   createMindmodelLookupTool,
   createOcttoTools,
   createPTYManager,
@@ -107,9 +112,7 @@ function extractTextFromParts(parts: Array<{ type: string; text?: string }>): st
     .join("");
 }
 
-// eslint-disable-next-line max-lines-per-function
-const OpenCodeConfigPlugin: Plugin = async (ctx) => {
-  // Validate external tool dependencies at startup
+async function checkToolDependencies(): Promise<void> {
   const astGrepStatus = await checkAstGrepAvailable();
   if (!astGrepStatus.available) {
     log.warn("micode", astGrepStatus.message ?? "ast-grep unavailable");
@@ -119,6 +122,102 @@ const OpenCodeConfigPlugin: Plugin = async (ctx) => {
   if (!btcaStatus.available) {
     log.warn("micode", btcaStatus.message ?? "btca unavailable");
   }
+}
+
+async function runConstraintReview(
+  ctx: PluginInput,
+  internalSessions: Set<string>,
+  reviewPrompt: string,
+): Promise<string> {
+  let sessionId: string | undefined;
+  try {
+    const sessionResult = await ctx.client.session.create({
+      body: { title: "constraint-reviewer" },
+    });
+
+    if (!sessionResult.data?.id) {
+      log.warn("mindmodel", "Failed to create reviewer session");
+      return '{"status": "PASS", "violations": [], "summary": "Review skipped"}';
+    }
+    sessionId = sessionResult.data.id;
+
+    internalSessions.add(sessionId);
+
+    const promptResult = await ctx.client.session.prompt({
+      path: { id: sessionId },
+      body: {
+        agent: "mm-constraint-reviewer",
+        tools: {},
+        parts: [{ type: "text", text: reviewPrompt }],
+      },
+    });
+
+    if (!promptResult.data?.parts) {
+      return '{"status": "PASS", "violations": [], "summary": "Empty response"}';
+    }
+
+    return extractTextFromParts(promptResult.data.parts);
+  } catch (error) {
+    log.warn("mindmodel", `Reviewer failed: ${extractErrorMessage(error)}`);
+    return '{"status": "PASS", "violations": [], "summary": "Review failed"}';
+  } finally {
+    if (sessionId) {
+      internalSessions.delete(sessionId);
+      await ctx.client.session.delete({ path: { id: sessionId } }).catch((_e: unknown) => {
+        /* fire-and-forget */
+      });
+    }
+  }
+}
+
+interface LocalLLMHooks {
+  contextBudgetHook: ReturnType<typeof createContextBudgetHook> | null;
+  readGuardHook: ReturnType<typeof createReadGuardHook> | null;
+  contextPinnerHook: ReturnType<typeof createContextPinnerHook> | null;
+}
+
+function createLocalLLMHooks(
+  isLocalLLM: boolean,
+  ctx: PluginInput,
+  userConfig: MicodeConfig | null,
+  modelContextLimits: Map<string, number>,
+): LocalLLMHooks {
+  if (!isLocalLLM) {
+    return { contextBudgetHook: null, readGuardHook: null, contextPinnerHook: null };
+  }
+
+  const contextBudgetHook = createContextBudgetHook(ctx, {
+    defaultContextLimit: userConfig?.localLLM?.contextLimit,
+    charPerToken: userConfig?.localLLM?.charPerToken,
+    maxReadRatio: userConfig?.localLLM?.maxReadRatio,
+    minRemainingRatio: userConfig?.localLLM?.minRemainingRatio,
+    outputBudget: userConfig?.localLLM?.outputBudget,
+    reasoningBudget: userConfig?.localLLM?.reasoningBudget,
+    modelContextLimits,
+  });
+
+  return {
+    contextBudgetHook,
+    readGuardHook: createReadGuardHook(contextBudgetHook),
+    contextPinnerHook: createContextPinnerHook(),
+  };
+}
+
+function warnUnknownFragmentAgents(userConfig: MicodeConfig | null): void {
+  if (!userConfig?.fragments) return;
+
+  const knownAgentNames = new Set(Object.keys(agents));
+  const fragmentAgentNames = Object.keys(userConfig.fragments);
+  const warnings = warnUnknownAgents(fragmentAgentNames, knownAgentNames);
+  for (const warning of warnings) {
+    log.warn("micode", warning);
+  }
+}
+
+// eslint-disable-next-line max-lines-per-function
+const OpenCodeConfigPlugin: Plugin = async (ctx) => {
+  // Validate external tool dependencies at startup
+  await checkToolDependencies();
 
   // Load user config for agent overrides and feature flags
   const userConfig = await loadMicodeConfig();
@@ -128,6 +227,9 @@ const OpenCodeConfigPlugin: Plugin = async (ctx) => {
 
   // Think mode state per session
   const thinkModeState = new Map<string, boolean>();
+
+  // Feature-flagged local LLM mode
+  const isLocalLLM = isLocalLLMProvider(ctx.providerID as string | undefined);
 
   // Hooks
   const autoCompactHook = createAutoCompactHook(ctx, {
@@ -147,15 +249,16 @@ const OpenCodeConfigPlugin: Plugin = async (ctx) => {
   // Fragment injector hook - injects user-defined prompt fragments
   const fragmentInjectorHook = createFragmentInjectorHook(ctx, userConfig);
 
+  // Local LLM hooks (only active when provider is a local LLM)
+  const { contextBudgetHook, readGuardHook, contextPinnerHook } = createLocalLLMHooks(
+    isLocalLLM,
+    ctx,
+    userConfig,
+    modelContextLimits,
+  );
+
   // Warn about unknown agent names in fragments config
-  if (userConfig?.fragments) {
-    const knownAgentNames = new Set(Object.keys(agents));
-    const fragmentAgentNames = Object.keys(userConfig.fragments);
-    const warnings = warnUnknownAgents(fragmentAgentNames, knownAgentNames);
-    for (const warning of warnings) {
-      log.warn("micode", warning);
-    }
-  }
+  warnUnknownFragmentAgents(userConfig);
 
   // Track internal sessions to prevent hook recursion (used by reviewer)
   const internalSessions = new Set<string>();
@@ -168,48 +271,9 @@ const OpenCodeConfigPlugin: Plugin = async (ctx) => {
   const mindmodelLookupTool = createMindmodelLookupTool(ctx);
 
   // Constraint reviewer hook - reviews generated code against .mindmodel/ constraints
-  const constraintReviewerHook = createConstraintReviewerHook(ctx, async (reviewPrompt) => {
-    let sessionId: string | undefined;
-    try {
-      const sessionResult = await ctx.client.session.create({
-        body: { title: "constraint-reviewer" },
-      });
-
-      if (!sessionResult.data?.id) {
-        log.warn("mindmodel", "Failed to create reviewer session");
-        return '{"status": "PASS", "violations": [], "summary": "Review skipped"}';
-      }
-      sessionId = sessionResult.data.id;
-
-      // Mark as internal to prevent hook recursion
-      internalSessions.add(sessionId);
-
-      const promptResult = await ctx.client.session.prompt({
-        path: { id: sessionId },
-        body: {
-          agent: "mm-constraint-reviewer",
-          tools: {},
-          parts: [{ type: "text", text: reviewPrompt }],
-        },
-      });
-
-      if (!promptResult.data?.parts) {
-        return '{"status": "PASS", "violations": [], "summary": "Empty response"}';
-      }
-
-      return extractTextFromParts(promptResult.data.parts);
-    } catch (error) {
-      log.warn("mindmodel", `Reviewer failed: ${extractErrorMessage(error)}`);
-      return '{"status": "PASS", "violations": [], "summary": "Review failed"}';
-    } finally {
-      if (sessionId) {
-        internalSessions.delete(sessionId);
-        await ctx.client.session.delete({ path: { id: sessionId } }).catch((_e: unknown) => {
-          /* fire-and-forget */
-        });
-      }
-    }
-  });
+  const constraintReviewerHook = createConstraintReviewerHook(ctx, (reviewPrompt) =>
+    runConstraintReview(ctx, internalSessions, reviewPrompt),
+  );
 
   // PTY System - load bun-pty with graceful degradation
   // Sets BUN_PTY_LIB env var to fix path resolution in OpenCode plugin environments
@@ -282,6 +346,7 @@ const OpenCodeConfigPlugin: Plugin = async (ctx) => {
       milestone_artifact_search,
       spawn_agent,
       batch_read,
+      ...(isLocalLLM && contextBudgetHook ? createCheckContextBudgetTool(contextBudgetHook) : {}),
       ...mindmodelLookupTool,
       ...ptyTools,
       ...octtoTools,
@@ -334,6 +399,11 @@ const OpenCodeConfigPlugin: Plugin = async (ctx) => {
 
       // Check for override command
       await constraintReviewerHook["chat.message"](input, output);
+
+      // Capture session goal for context reminders
+      if (contextPinnerHook) {
+        await contextPinnerHook["chat.message"](input, output);
+      }
     },
 
     "chat.params": async (input, output) => {
@@ -348,6 +418,16 @@ const OpenCodeConfigPlugin: Plugin = async (ctx) => {
 
       // Inject context window status
       await contextWindowMonitorHook["chat.params"](input, output);
+
+      // Track context budget status
+      if (contextBudgetHook) {
+        await contextBudgetHook["chat.params"](input);
+      }
+
+      // Inject periodic context reminders
+      if (contextPinnerHook) {
+        await contextPinnerHook["chat.params"](input, output);
+      }
 
       // If think mode was requested, increase thinking budget
       if (thinkModeState.get(input.sessionID)) {
@@ -366,18 +446,12 @@ const OpenCodeConfigPlugin: Plugin = async (ctx) => {
       input: { sessionID: string },
       output: { context: string[]; prompt?: string },
     ) => {
-      // Get file operations for this session
-      const fileOps = getFileOps(input.sessionID);
-      const readPaths = Array.from(fileOps.read).sort();
-      const modifiedPaths = Array.from(fileOps.modified).sort();
+      const fileOpsSection = formatFileOpsSection(input.sessionID);
 
-      const fileOpsSection = `
-## File Operations
-### Read
-${readPaths.length > 0 ? readPaths.map((p) => `- \`${p}\``).join("\n") : "- (none)"}
-
-### Modified
-${modifiedPaths.length > 0 ? modifiedPaths.map((p) => `- \`${p}\``).join("\n") : "- (none)"}`;
+      // Augment compaction prompt with context-pinner hints
+      if (contextPinnerHook) {
+        await contextPinnerHook["experimental.session.compacting"](input, output);
+      }
 
       output.prompt = `Create a structured summary for continuing this conversation. Use this EXACT format:
 
@@ -451,6 +525,14 @@ IMPORTANT:
         { tool: input.tool, sessionID: input.sessionID, args: input.args },
         output,
       );
+
+      // Read guard — intercept read tool outputs when budget is tight
+      if (readGuardHook) {
+        await readGuardHook["tool.execute.after"](
+          { tool: input.tool, sessionID: input.sessionID, args: input.args },
+          output,
+        );
+      }
     },
 
     // Transform messages: match task keywords and prepare mindmodel injection
@@ -503,8 +585,32 @@ IMPORTANT:
 
       // Fetch tracker cleanup
       await fetchTrackerHook.event({ event });
+
+      // Track context budget usage (message.updated events)
+      if (contextBudgetHook) {
+        await contextBudgetHook.event({ event });
+      }
+
+      // Session cleanup and post-compaction detection for context reminders
+      if (contextPinnerHook) {
+        await contextPinnerHook.event({ event });
+      }
     },
   };
 };
+
+function formatFileOpsSection(sessionID: string): string {
+  const fileOps = getFileOps(sessionID);
+  const readPaths = Array.from(fileOps.read).sort();
+  const modifiedPaths = Array.from(fileOps.modified).sort();
+
+  return `
+## File Operations
+### Read
+${readPaths.length > 0 ? readPaths.map((p) => `- \`${p}\``).join("\n") : "- (none)"}
+
+### Modified
+${modifiedPaths.length > 0 ? modifiedPaths.map((p) => `- \`${p}\``).join("\n") : "- (none)"}`;
+}
 
 export { OpenCodeConfigPlugin };

@@ -151,6 +151,26 @@ export const config = {
   },
 
   /**
+   * Local LLM settings
+   */
+  localLLM: {
+    /** Default context window limit for local LLMs (tokens) */
+    defaultContextLimit: 32_768,
+    /** Characters per token for local LLM token estimation (code is denser) */
+    charPerToken: 2,
+    /** Max ratio of remaining budget a single read can consume */
+    maxReadRatio: 0.3,
+    /** Minimum ratio of budget that must remain after a read */
+    minRemainingRatio: 0.25,
+    /** Messages between context reminders */
+    reminderInterval: 5,
+    /** Budget reserved for model output (tokens) */
+    outputBudget: 4_096,
+    /** Budget reserved for reasoning/thinking (tokens) */
+    reasoningBudget: 4_096,
+  },
+
+  /**
    * Mindmodel v2 settings
    */
   mindmodel: {

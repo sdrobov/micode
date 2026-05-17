@@ -11,6 +11,7 @@ import {
   extractContextLimits,
   extractProviderModels,
   OpencodeConfigSchema,
+  parseLocalLLMConfig,
   RawMicodeConfigSchema,
   sanitizeAgentsRecord,
   sanitizeCompactionThreshold,
@@ -137,6 +138,7 @@ export interface AgentOverride {
 
 export interface MicodeFeatures {
   readonly mindmodelInjection?: boolean;
+  readonly localLLM?: boolean;
 }
 
 export interface MicodeConfig {
@@ -144,6 +146,7 @@ export interface MicodeConfig {
   features?: MicodeFeatures;
   compactionThreshold?: number;
   fragments?: Record<string, string[]>;
+  localLLM?: import("./config-schemas").LocalLLMConfig | null;
 }
 
 /**
@@ -163,6 +166,14 @@ export async function loadMicodeConfig(configDir?: string): Promise<MicodeConfig
   } catch {
     return null;
   }
+}
+
+/**
+ * Parse and validate localLLM configuration from micode.json
+ */
+export function sanitizeLocalLLMConfig(raw: unknown): import("./config-schemas").LocalLLMConfig | null {
+  if (!raw || typeof raw !== "object") return null;
+  return parseLocalLLMConfig(raw);
 }
 
 function buildMicodeConfig(raw: unknown): MicodeConfig {
@@ -187,6 +198,10 @@ function buildMicodeConfig(raw: unknown): MicodeConfig {
 
   if (config.fragments) {
     micodeConfig.fragments = sanitizeFragments(config.fragments);
+  }
+
+  if (config.localLLM) {
+    micodeConfig.localLLM = sanitizeLocalLLMConfig(config.localLLM);
   }
 
   return micodeConfig;

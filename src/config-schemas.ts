@@ -18,6 +18,7 @@ const AgentOverrideSchema = v.object({
 
 const MicodeFeaturesSchema = v.object({
   mindmodelInjection: v.optional(v.boolean()),
+  localLLM: v.optional(v.boolean()),
 });
 
 /**
@@ -35,6 +36,7 @@ export const RawMicodeConfigSchema = v.object({
   ),
   compactionThreshold: v.optional(v.unknown()),
   fragments: v.optional(v.record(v.string(), v.unknown())),
+  localLLM: v.optional(v.unknown()),
 });
 
 // Safe properties that users can override in agent configs
@@ -188,4 +190,51 @@ export function extractContextLimits(providerRaw: Record<string, unknown>): Map<
     collectProviderContextLimits(providerId, providerParsed.output.models, limits);
   }
   return limits;
+}
+
+// --- Local LLM config schemas ---
+
+const DEFAULT_LOCAL_LLM_CONTEXT = 32_768;
+const DEFAULT_LOCAL_LLM_CHAR_PER_TOKEN = 2;
+const DEFAULT_LOCAL_LLM_MAX_READ_RATIO = 0.3;
+const DEFAULT_LOCAL_LLM_MIN_REMAINING_RATIO = 0.25;
+const DEFAULT_LOCAL_LLM_REMINDER_INTERVAL = 5;
+const DEFAULT_LOCAL_LLM_OUTPUT_BUDGET = 4_096;
+const DEFAULT_LOCAL_LLM_REASONING_BUDGET = 4_096;
+
+export const LocalLLMConfigSchema = v.object({
+  contextLimit: v.optional(v.pipe(v.number(), v.minValue(1)), DEFAULT_LOCAL_LLM_CONTEXT),
+  charPerToken: v.optional(v.pipe(v.number(), v.minValue(1)), DEFAULT_LOCAL_LLM_CHAR_PER_TOKEN),
+  maxReadRatio: v.optional(v.pipe(v.number(), v.minValue(0), v.maxValue(1)), DEFAULT_LOCAL_LLM_MAX_READ_RATIO),
+  minRemainingRatio: v.optional(
+    v.pipe(v.number(), v.minValue(0), v.maxValue(1)),
+    DEFAULT_LOCAL_LLM_MIN_REMAINING_RATIO,
+  ),
+  reminderInterval: v.optional(v.pipe(v.number(), v.minValue(1)), DEFAULT_LOCAL_LLM_REMINDER_INTERVAL),
+  outputBudget: v.optional(v.pipe(v.number(), v.minValue(1)), DEFAULT_LOCAL_LLM_OUTPUT_BUDGET),
+  reasoningBudget: v.optional(v.pipe(v.number(), v.minValue(1)), DEFAULT_LOCAL_LLM_REASONING_BUDGET),
+});
+
+export type LocalLLMConfig = v.InferOutput<typeof LocalLLMConfigSchema>;
+
+/**
+ * Parse and validate a raw localLLM config object.
+ * Returns null on invalid input.
+ */
+export function parseLocalLLMConfig(raw: unknown): LocalLLMConfig | null {
+  const result = v.safeParse(LocalLLMConfigSchema, raw);
+  if (!result.success) return null;
+  return result.output;
+}
+
+const LOCAL_LLM_PROVIDER_PATTERNS = ["ollama", "local", "lm-studio", "llamacpp"] as const;
+
+/**
+ * Detect whether a provider ID refers to a local LLM.
+ * Matches patterns: ollama, local, lm-studio, llamacpp
+ */
+export function isLocalLLMProvider(providerID: string | undefined): boolean {
+  if (!providerID) return false;
+  const lower = providerID.toLowerCase();
+  return LOCAL_LLM_PROVIDER_PATTERNS.some((pattern) => lower.includes(pattern));
 }
