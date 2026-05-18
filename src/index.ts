@@ -21,6 +21,7 @@ import {
   createReadGuardHook,
   createSessionRecoveryHook,
   createTokenAwareTruncationHook,
+  createToolLoopGuardHook,
   getFileOps,
   warnUnknownAgents,
 } from "@/hooks";
@@ -174,6 +175,12 @@ interface LocalLLMHooks {
   contextBudgetHook: ReturnType<typeof createContextBudgetHook> | null;
   readGuardHook: ReturnType<typeof createReadGuardHook> | null;
   contextPinnerHook: ReturnType<typeof createContextPinnerHook> | null;
+  toolLoopGuardHook: ReturnType<typeof createToolLoopGuardHook> | null;
+}
+
+function getProviderID(ctx: PluginInput): string | undefined {
+  const record = ctx as Record<string, unknown>;
+  return typeof record.providerID === "string" ? record.providerID : undefined;
 }
 
 function createLocalLLMHooks(
@@ -183,7 +190,7 @@ function createLocalLLMHooks(
   modelContextLimits: Map<string, number>,
 ): LocalLLMHooks {
   if (!isLocalLLM) {
-    return { contextBudgetHook: null, readGuardHook: null, contextPinnerHook: null };
+    return { contextBudgetHook: null, readGuardHook: null, contextPinnerHook: null, toolLoopGuardHook: null };
   }
 
   const contextBudgetHook = createContextBudgetHook(ctx, {
@@ -200,6 +207,10 @@ function createLocalLLMHooks(
     contextBudgetHook,
     readGuardHook: createReadGuardHook(contextBudgetHook),
     contextPinnerHook: createContextPinnerHook(),
+    toolLoopGuardHook: createToolLoopGuardHook(ctx, {
+      threshold: userConfig?.localLLM?.toolLoopThreshold,
+      maxInterventions: userConfig?.localLLM?.toolLoopMaxInterventions,
+    }),
   };
 }
 
@@ -229,7 +240,7 @@ const OpenCodeConfigPlugin: Plugin = async (ctx) => {
   const thinkModeState = new Map<string, boolean>();
 
   // Feature-flagged local LLM mode
-  const isLocalLLM = isLocalLLMProvider(ctx.providerID as string | undefined);
+  const isLocalLLM = isLocalLLMProvider(getProviderID(ctx));
 
   // Hooks
   const autoCompactHook = createAutoCompactHook(ctx, {
@@ -250,7 +261,7 @@ const OpenCodeConfigPlugin: Plugin = async (ctx) => {
   const fragmentInjectorHook = createFragmentInjectorHook(ctx, userConfig);
 
   // Local LLM hooks (only active when provider is a local LLM)
-  const { contextBudgetHook, readGuardHook, contextPinnerHook } = createLocalLLMHooks(
+  const { contextBudgetHook, readGuardHook, contextPinnerHook, toolLoopGuardHook } = createLocalLLMHooks(
     isLocalLLM,
     ctx,
     userConfig,
@@ -322,6 +333,7 @@ const OpenCodeConfigPlugin: Plugin = async (ctx) => {
     ptyManager.cleanupBySession(sessionId);
     constraintReviewerHook.cleanupSession(sessionId);
     fetchTrackerHook.cleanupSession(sessionId);
+    toolLoopGuardHook?.cleanupSession(sessionId);
 
     // Cleanup octto sessions
     const sessionOcttoIds = octtoSessions.get(sessionId);
@@ -529,6 +541,13 @@ IMPORTANT:
       // Read guard — intercept read tool outputs when budget is tight
       if (readGuardHook) {
         await readGuardHook["tool.execute.after"](
+          { tool: input.tool, sessionID: input.sessionID, args: input.args },
+          output,
+        );
+      }
+
+      if (toolLoopGuardHook) {
+        await toolLoopGuardHook["tool.execute.after"](
           { tool: input.tool, sessionID: input.sessionID, args: input.args },
           output,
         );

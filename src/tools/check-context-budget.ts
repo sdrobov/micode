@@ -66,7 +66,7 @@ Returns budget status and recommendations.`,
         .describe("Grep query to estimate (not currently implemented — reserved for future)"),
       reserveForThinking: tool.schema.number().optional().describe("Override thinking reservation (default: 4096)"),
       reserveForOutput: tool.schema.number().optional().describe("Override output reservation (default: 4096)"),
-    } as Record<string, unknown>,
+    },
     execute: async (args: CheckBudgetArgs, toolCtx: ToolContext) => executeCheckContextBudget(budget, args, toolCtx),
   });
 

@@ -53,3 +53,8 @@ export {
 } from "./read-guard";
 export { createSessionRecoveryHook } from "./session-recovery";
 export { createTokenAwareTruncationHook } from "./token-aware-truncation";
+export {
+  createToolLoopGuardHook,
+  type ToolLoopGuardConfig,
+  type ToolLoopGuardHooks,
+} from "./tool-loop-guard";

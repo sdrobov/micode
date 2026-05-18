@@ -168,6 +168,10 @@ export const config = {
     outputBudget: 4_096,
     /** Budget reserved for reasoning/thinking (tokens) */
     reasoningBudget: 4_096,
+    /** Interrupt repeated identical tool failures after this many attempts */
+    toolLoopThreshold: 3,
+    /** Max hard interruptions per tool-loop signature before falling back to a blocker */
+    toolLoopMaxInterventions: 1,
   },
 
   /**

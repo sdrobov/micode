@@ -4,6 +4,7 @@ import { isLocalLLMProvider } from "../src/config-schemas";
 import { type ContextBudgetHooks, createContextBudgetHook } from "../src/hooks/context-budget";
 import { type ContextPinnerHooks, createContextPinnerHook } from "../src/hooks/context-pinner";
 import { createReadGuardHook, type ReadGuardHooks } from "../src/hooks/read-guard";
+import { createToolLoopGuardHook, type ToolLoopGuardHooks } from "../src/hooks/tool-loop-guard";
 
 function createMockCtx() {
   return {
@@ -156,5 +157,40 @@ describe("local-llm-integration - read guard respects non-read tools", () => {
     const editOutput = { output: "console.log('hello');" };
     await guard["tool.execute.after"]({ tool: "Edit", sessionID: "s1", args: { filePath: "/test.ts" } }, editOutput);
     expect(editOutput.output).toBe("console.log('hello');");
+  });
+});
+
+describe("local-llm-integration - tool loop guard lifecycle", () => {
+  it("should interrupt repeated identical failures for local LLM sessions", async () => {
+    let aborts = 0;
+    const prompts: string[] = [];
+    const ctx = {
+      client: {
+        session: {
+          abort: async () => {
+            aborts += 1;
+          },
+          prompt: async ({ body }: { body: { parts: Array<{ text?: string }> } }) => {
+            prompts.push(body.parts[0]?.text ?? "");
+          },
+        },
+        tui: { showToast: async () => {} },
+      },
+      directory: "/test",
+    } as any;
+    const guard: ToolLoopGuardHooks = createToolLoopGuardHook(ctx, { abortSettleDelayMs: 0, threshold: 2 });
+
+    await guard["tool.execute.after"](
+      { tool: "pty_write", sessionID: "local-1", args: { id: "pty_1", data: "ls\n" } },
+      { output: "Error: Missing required parameter 'session_id'" },
+    );
+    await guard["tool.execute.after"](
+      { tool: "pty_write", sessionID: "local-1", args: { id: "pty_1", data: "ls\n" } },
+      { output: "Error: Missing required parameter 'session_id'" },
+    );
+
+    expect(aborts).toBe(1);
+    expect(prompts).toHaveLength(1);
+    expect(prompts[0]).toContain("tool loop was interrupted");
   });
 });

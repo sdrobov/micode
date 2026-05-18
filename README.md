@@ -86,6 +86,7 @@ Maintain context across sessions with structured compaction. Run `/ledger` to cr
 - **Artifact Auto-Index** - Indexes artifacts in thoughts/ directories
 - **Context Injector** - Injects ARCHITECTURE.md, CODE_STYLE.md
 - **Token-Aware Truncation** - Truncates large tool outputs
+- **Tool Loop Guard** - Interrupts repeated identical failing tool calls for local LLMs and redirects the run
 
 ## Configuration
 
@@ -120,6 +121,11 @@ Create `~/.config/opencode/micode.json` for micode-specific settings:
     "mindmodelInjection": true
   },
   "compactionThreshold": 0.5,
+  "localLLM": {
+    "contextLimit": 32768,
+    "toolLoopThreshold": 3,
+    "toolLoopMaxInterventions": 1
+  },
   "fragments": {
     "commander": ["custom-instructions.md"]
   }
@@ -135,6 +141,9 @@ Create `~/.config/opencode/micode.json` for micode-specific settings:
 | `agents` | object | Per-agent overrides (model, temperature, maxTokens, thinking) |
 | `features.mindmodelInjection` | boolean | Enable mindmodel context injection |
 | `compactionThreshold` | number | Context usage threshold (0-1) for auto-compaction. Default: 0.5 |
+| `localLLM.contextLimit` | number | Override local LLM context limit. Default: 32768 |
+| `localLLM.toolLoopThreshold` | number | Interrupt after this many identical failing tool calls. Default: 3 |
+| `localLLM.toolLoopMaxInterventions` | number | Max hard interruptions per repeated failure signature before falling back to a blocker. Default: 1 |
 | `fragments` | object | Additional prompt fragments per agent |
 
 #### Model Resolution Priority

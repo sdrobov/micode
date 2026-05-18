@@ -201,6 +201,8 @@ const DEFAULT_LOCAL_LLM_MIN_REMAINING_RATIO = 0.25;
 const DEFAULT_LOCAL_LLM_REMINDER_INTERVAL = 5;
 const DEFAULT_LOCAL_LLM_OUTPUT_BUDGET = 4_096;
 const DEFAULT_LOCAL_LLM_REASONING_BUDGET = 4_096;
+const DEFAULT_LOCAL_LLM_TOOL_LOOP_THRESHOLD = 3;
+const DEFAULT_LOCAL_LLM_TOOL_LOOP_MAX_INTERVENTIONS = 1;
 
 export const LocalLLMConfigSchema = v.object({
   contextLimit: v.optional(v.pipe(v.number(), v.minValue(1)), DEFAULT_LOCAL_LLM_CONTEXT),
@@ -213,6 +215,11 @@ export const LocalLLMConfigSchema = v.object({
   reminderInterval: v.optional(v.pipe(v.number(), v.minValue(1)), DEFAULT_LOCAL_LLM_REMINDER_INTERVAL),
   outputBudget: v.optional(v.pipe(v.number(), v.minValue(1)), DEFAULT_LOCAL_LLM_OUTPUT_BUDGET),
   reasoningBudget: v.optional(v.pipe(v.number(), v.minValue(1)), DEFAULT_LOCAL_LLM_REASONING_BUDGET),
+  toolLoopThreshold: v.optional(v.pipe(v.number(), v.minValue(2)), DEFAULT_LOCAL_LLM_TOOL_LOOP_THRESHOLD),
+  toolLoopMaxInterventions: v.optional(
+    v.pipe(v.number(), v.minValue(1)),
+    DEFAULT_LOCAL_LLM_TOOL_LOOP_MAX_INTERVENTIONS,
+  ),
 });
 
 export type LocalLLMConfig = v.InferOutput<typeof LocalLLMConfigSchema>;

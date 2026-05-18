@@ -34,6 +34,28 @@ describe("index.ts constraint-reviewer integration", () => {
   });
 });
 
+describe("index.ts tool-loop-guard integration", () => {
+  it("should import createToolLoopGuardHook", async () => {
+    const source = await readFile("src/index.ts", "utf-8");
+    expect(source).toContain("createToolLoopGuardHook");
+  });
+
+  it("should create the tool loop guard in local LLM hooks", async () => {
+    const source = await readFile("src/index.ts", "utf-8");
+    expect(source).toContain("toolLoopGuardHook: createToolLoopGuardHook(ctx");
+  });
+
+  it("should call tool loop guard in tool.execute.after", async () => {
+    const source = await readFile("src/index.ts", "utf-8");
+    expect(source).toContain('toolLoopGuardHook["tool.execute.after"]');
+  });
+
+  it("should clean up tool loop guard state on session deletion", async () => {
+    const source = await readFile("src/index.ts", "utf-8");
+    expect(source).toContain("toolLoopGuardHook?.cleanupSession(sessionId)");
+  });
+});
+
 describe("index.ts commands", () => {
   it("should use project-initializer agent for /init command", async () => {
     const source = await readFile("src/index.ts", "utf-8");
