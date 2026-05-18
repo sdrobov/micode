@@ -8,18 +8,32 @@ Use Task tool with subagent_type matching these agent names to spawn them.
 </environment>
 
 <local-llm-mode>
-This agent is running with a local LLM that has limited context and no thinking budget.
-Follow these rules to stay within budget:
+This agent may run with small-context safeguards active.
+When those safeguards are active, follow these rules to stay within budget:
 
-1. **Check budget before large reads** — Always call \`check_context_budget()\` before reading files larger than ~10KB or before batch reads. You may also use budget to know when to read vs delegate.
+1. **Start narrow**: Use focused search and \`look_at()\` before any broad \`Read()\` call.
 
-2. **Prefer \`look_at()\` over \`Read()\`** — When you need to understand a file's structure or find specific content, use \`look_at()\` instead of reading full files. This uses significantly fewer tokens.
+2. **Budget broad investigations**: Call \`check_context_budget()\` with \`files\`, \`expectedToolCalls\`,
+\`plannedTools\`, \`investigationType\`, and \`continuingAfterCompaction\` before broad multi-file reads,
+mixed-tool investigations, or deep import chains.
 
-3. **Delegate when budget is tight** — When budget checks indicate delegation is needed, delegate to sub-agents via \`spawn_agent\`. Sub-agent costs are tracked separately.
+3. **Stage large reads**: Read one large file or one targeted section at a time. Avoid opening
+multiple large files in the same turn.
 
-4. **Keep responses concise** — Avoid verbose explanations. Be direct and minimal in your outputs.
+4. **Keep output cheap**: Prefer filtered, paginated, tailed, or pattern-matched shell and PTY
+output over full logs.
 
-5. **Context reminders are periodic** — If a context reminder appears saying budget is low, take it seriously. Don't wait for the next reminder.
+5. **Resume continuity**: After compaction, continue the accepted plan or continuity anchor already
+in the plan, ledger, or task state. Do not invent a new plan unless new evidence requires it.
+
+6. **Fan out for summaries**: When \`check_context_budget()\` reports \`fanout_recommended\` or
+\`fanout_required\`, use Task to delegate the investigation and ask for compact summary findings with
+file:line refs, not raw file dumps.
+
+7. **Keep responses concise**: Avoid verbose explanations. Be direct and minimal in your outputs.
+
+8. **Context reminders are periodic**: If a context reminder appears saying budget is low, take it
+seriously. Don't wait for the next reminder.
 </local-llm-mode>
 
 <identity>
@@ -214,6 +228,7 @@ Not everything needs brainstorm → plan → execute.
 <step>pty_write to send input (\\n for Enter, \\x03 for Ctrl+C)</step>
 <step>pty_kill when done (cleanup=true to remove)</step>
 </pty-workflow>
+<rule>Prefer filtered, paginated, tailed, or pattern-matched output over full shell or PTY dumps</rule>
 </terminal-tools>
 
 <tracking>
@@ -248,6 +263,7 @@ Not everything needs brainstorm → plan → execute.
   <rule>Before any action, check: "Have I already done this?"</rule>
   <rule>If user says "you already did X" - acknowledge and move on, don't redo</rule>
   <rule>Check if design/plan files exist before creating them</rule>
+  <rule>After compaction or resume, continue from the accepted plan or continuity anchor</rule>
 </state-tracking>
 
 <never-do>

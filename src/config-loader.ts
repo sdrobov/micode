@@ -7,11 +7,13 @@ import { join } from "node:path";
 import type { AgentConfig } from "@opencode-ai/sdk";
 import { type ParseError, parse as parseJsonc } from "jsonc-parser";
 import * as v from "valibot";
+import type { LocalLLMConfig, SmallContextConfig } from "@/config-schemas";
 import {
   extractContextLimits,
   extractProviderModels,
   OpencodeConfigSchema,
   parseLocalLLMConfig,
+  parseSmallContextConfig,
   RawMicodeConfigSchema,
   sanitizeAgentsRecord,
   sanitizeCompactionThreshold,
@@ -146,7 +148,8 @@ export interface MicodeConfig {
   features?: MicodeFeatures;
   compactionThreshold?: number;
   fragments?: Record<string, string[]>;
-  localLLM?: import("./config-schemas").LocalLLMConfig | null;
+  localLLM?: LocalLLMConfig | null;
+  smallContext?: SmallContextConfig | null;
 }
 
 /**
@@ -171,9 +174,17 @@ export async function loadMicodeConfig(configDir?: string): Promise<MicodeConfig
 /**
  * Parse and validate localLLM configuration from micode.json
  */
-export function sanitizeLocalLLMConfig(raw: unknown): import("./config-schemas").LocalLLMConfig | null {
+export function sanitizeLocalLLMConfig(raw: unknown): LocalLLMConfig | null {
   if (!raw || typeof raw !== "object") return null;
   return parseLocalLLMConfig(raw);
+}
+
+/**
+ * Parse and validate smallContext configuration from micode.json
+ */
+export function sanitizeSmallContextConfig(raw: unknown): SmallContextConfig | null {
+  if (!raw || typeof raw !== "object") return null;
+  return parseSmallContextConfig(raw);
 }
 
 function buildMicodeConfig(raw: unknown): MicodeConfig {
@@ -202,6 +213,10 @@ function buildMicodeConfig(raw: unknown): MicodeConfig {
 
   if (config.localLLM) {
     micodeConfig.localLLM = sanitizeLocalLLMConfig(config.localLLM);
+  }
+
+  if (config.smallContext) {
+    micodeConfig.smallContext = sanitizeSmallContextConfig(config.smallContext);
   }
 
   return micodeConfig;

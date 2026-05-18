@@ -1,17 +1,23 @@
-// src/hooks/context-pinner.ts
-// Captures session goals and periodically re-injects context reminders
 import { config } from "@/utils/config";
 
-const MAX_SNIPPET_LENGTH = 500;
+import {
+  type ContinuityHookConfig,
+  clearSessionContinuity,
+  extractContinuityMessageUpdate,
+  formatCompactionContinuityContext,
+  formatContinuityAnchor,
+  getContinuityAnchorBudget,
+  getSessionContinuityAnchor,
+  isContinuityAnchorActive,
+  mergeSessionContinuityAnchor,
+  updateSessionContinuityProfile,
+} from "./continuity-anchor";
+
 const NOT_CAPTURED = "(not captured yet)";
 
 interface SessionPinnerState {
-  goal: string;
-  plan: string;
   dod: string;
-  completed: string[];
   messageCount: number;
-  lastReminderIndex: number;
   pendingPostCompaction: boolean;
 }
 
@@ -32,74 +38,86 @@ export interface ContextPinnerHooks {
 }
 
 function getOrCreateSession(sessions: Map<string, SessionPinnerState>, id: string): SessionPinnerState {
-  let state = sessions.get(id);
-  if (state) return state;
+  const existing = sessions.get(id);
+  if (existing) return existing;
 
-  state = {
-    goal: "",
-    plan: "",
+  const created = {
     dod: "",
-    completed: [],
     messageCount: 0,
-    lastReminderIndex: 0,
     pendingPostCompaction: false,
   };
-  sessions.set(id, state);
-  return state;
+  sessions.set(id, created);
+  return created;
 }
 
-function buildReminder(sessionID: string, state: SessionPinnerState): string {
-  const goal = state.goal || NOT_CAPTURED;
-  const plan = state.plan || NOT_CAPTURED;
+function extractText(parts?: Array<{ type: string; text?: string }>): string {
+  return (
+    parts
+      ?.filter((part) => part.type === "text")
+      .map((part) => part.text)
+      .join(" ") || ""
+  );
+}
+
+function extractDod(text: string): string {
+  const match = text.match(/(?:dod|definition of done)[:\s]+(.+?)(?:$)/i);
+  return match?.[1]?.trim() ?? "";
+}
+
+function buildLegacyReminder(sessionID: string, state: SessionPinnerState): string {
+  const anchor = getSessionContinuityAnchor(sessionID);
+  const goal = anchor?.goal || NOT_CAPTURED;
+  const plan = anchor?.acceptedPlan || NOT_CAPTURED;
   const dod = state.dod || NOT_CAPTURED;
-  const completed = state.completed.length > 0 ? state.completed.join(", ") : "(none)";
+  const completed = anchor?.completed.length ? anchor.completed.join(", ") : "(none)";
 
   return `<context-reminder session="${sessionID}">
   Original goal: ${goal}
   Plan: ${plan}
   DoD remaining: ${dod}
   Completed: ${completed}
-  This is a periodic context reminder. Do not restart — continue the current plan.
+  This is a periodic context reminder. Do not restart; continue the current plan.
 </context-reminder>`;
 }
 
-function extractText(parts?: Array<{ type: string; text?: string }>): string {
-  return (
-    parts
-      ?.filter((p) => p.type === "text")
-      .map((p) => p.text)
-      .join(" ") || ""
-  );
-}
-
-function extractGoalMetadata(text: string, state: SessionPinnerState): void {
-  const planMatch = text.match(/plan[:\s]+(.+?)(?:dod|doctrine|$)/i);
-  if (planMatch) {
-    state.plan = planMatch[1].trim().slice(0, MAX_SNIPPET_LENGTH);
+function buildReminder(sessionID: string, state: SessionPinnerState, hookConfig?: ContinuityHookConfig): string {
+  if (!isContinuityAnchorActive(sessionID)) {
+    return buildLegacyReminder(sessionID, state);
   }
 
-  const dodMatch = text.match(/(?:dod|definition of done)[:\s]+(.+?)(?:$)/i);
-  if (dodMatch) {
-    state.dod = dodMatch[1].trim().slice(0, MAX_SNIPPET_LENGTH);
-  }
+  const budgetTokens = getContinuityAnchorBudget(hookConfig);
+  const anchor = getSessionContinuityAnchor(sessionID);
+  return `${formatContinuityAnchor(sessionID, anchor, budgetTokens)}
+
+This is a continuity reminder. Continue the accepted plan and current step.`;
 }
 
-function handleSessionDeleted(
-  sessions: Map<string, SessionPinnerState>,
-  props: Record<string, unknown> | undefined,
+function injectReminder(
+  sessionID: string,
+  state: SessionPinnerState,
+  output: { system?: string },
+  hookConfig?: ContinuityHookConfig,
 ): void {
-  const sessionInfo = props?.info as { id?: string } | undefined;
-  if (!sessionInfo?.id) return;
-  sessions.delete(sessionInfo.id);
+  if (!output.system) return;
+  output.system = `${output.system}\n\n${buildReminder(sessionID, state, hookConfig)}`;
 }
 
 function handleMessageUpdated(
   sessions: Map<string, SessionPinnerState>,
+  hookConfig: ContinuityHookConfig | undefined,
   props: Record<string, unknown> | undefined,
 ): void {
   const info = props?.info as Record<string, unknown> | undefined;
   const sessionID = info?.sessionID as string | undefined;
   if (!sessionID) return;
+
+  updateSessionContinuityProfile(
+    sessionID,
+    (info?.modelID as string) || "",
+    (info?.providerID as string) || "",
+    hookConfig,
+  );
+
   if (info?.summary !== true) return;
 
   const state = sessions.get(sessionID);
@@ -107,14 +125,9 @@ function handleMessageUpdated(
   state.pendingPostCompaction = true;
 }
 
-function injectReminder(sessionID: string, state: SessionPinnerState, output: { system?: string }): void {
-  if (!output.system) return;
-  const reminder = buildReminder(sessionID, state);
-  output.system = `${output.system}\n\n${reminder}`;
-}
-
 function createMessageHandler(
   sessions: Map<string, SessionPinnerState>,
+  hookConfig?: ContinuityHookConfig,
 ): (
   input: { sessionID: string; parts?: Array<{ type: string; text?: string }> },
   output: { parts?: Array<{ type: string; text?: string }> },
@@ -124,65 +137,85 @@ function createMessageHandler(
     state.messageCount++;
 
     const text = extractText(input.parts);
-    if (state.goal || !text) return;
+    if (!text) return;
 
-    state.goal = text.slice(0, MAX_SNIPPET_LENGTH);
-    extractGoalMetadata(text, state);
+    const isInitialCapture = !getSessionContinuityAnchor(input.sessionID)?.goal;
+    const update = extractContinuityMessageUpdate(text, isInitialCapture);
+    mergeSessionContinuityAnchor(input.sessionID, update, getContinuityAnchorBudget(hookConfig));
+
+    const dod = extractDod(text);
+    if (dod) {
+      state.dod = dod;
+    }
   };
 }
 
 function createParamsHandler(
   sessions: Map<string, SessionPinnerState>,
+  hookConfig?: ContinuityHookConfig,
 ): (input: { sessionID: string }, output: { options?: Record<string, unknown>; system?: string }) => Promise<void> {
   return async (input, output) => {
     const state = getOrCreateSession(sessions, input.sessionID);
 
     if (state.pendingPostCompaction) {
-      injectReminder(input.sessionID, state, output);
+      injectReminder(input.sessionID, state, output, hookConfig);
       state.pendingPostCompaction = false;
       return;
     }
 
     if (state.messageCount > 0 && state.messageCount % config.localLLM.reminderInterval === 0) {
-      injectReminder(input.sessionID, state, output);
+      injectReminder(input.sessionID, state, output, hookConfig);
     }
   };
 }
 
 function createEventHandler(
   sessions: Map<string, SessionPinnerState>,
+  hookConfig?: ContinuityHookConfig,
 ): (input: { event: { type: string; properties?: unknown } }) => Promise<void> {
   return async ({ event }) => {
     const props = event.properties as Record<string, unknown> | undefined;
 
     if (event.type === "session.deleted") {
-      handleSessionDeleted(sessions, props);
+      const sessionInfo = props?.info as { id?: string } | undefined;
+      if (!sessionInfo?.id) return;
+      sessions.delete(sessionInfo.id);
+      clearSessionContinuity(sessionInfo.id);
       return;
     }
 
     if (event.type === "message.updated") {
-      handleMessageUpdated(sessions, props);
+      handleMessageUpdated(sessions, hookConfig, props);
     }
   };
 }
 
-function createCompactingHandler(): (
-  input: { sessionID: string },
-  output: { context?: string[]; prompt?: string },
-) => Promise<void> {
-  return async (_input, output) => {
+function createCompactingHandler(
+  hookConfig?: ContinuityHookConfig,
+): (input: { sessionID: string }, output: { context?: string[]; prompt?: string }) => Promise<void> {
+  return async (input, output) => {
+    if (isContinuityAnchorActive(input.sessionID)) {
+      const anchor = getSessionContinuityAnchor(input.sessionID);
+      const budgetTokens = getContinuityAnchorBudget(hookConfig);
+      output.context = [
+        ...(output.context ?? []),
+        formatCompactionContinuityContext(input.sessionID, anchor, budgetTokens),
+      ];
+      return;
+    }
+
     if (output.prompt && !output.prompt.includes("Goal")) {
       output.prompt = `${output.prompt}\n\nIMPORTANT: Preserve the original goal, plan, and DoD in the summary.`;
     }
   };
 }
 
-export function createContextPinnerHook(): ContextPinnerHooks {
+export function createContextPinnerHook(hookConfig?: ContinuityHookConfig): ContextPinnerHooks {
   const sessions = new Map<string, SessionPinnerState>();
   return {
-    "chat.message": createMessageHandler(sessions),
-    "chat.params": createParamsHandler(sessions),
-    event: createEventHandler(sessions),
-    "experimental.session.compacting": createCompactingHandler(),
+    "chat.message": createMessageHandler(sessions, hookConfig),
+    "chat.params": createParamsHandler(sessions, hookConfig),
+    event: createEventHandler(sessions, hookConfig),
+    "experimental.session.compacting": createCompactingHandler(hookConfig),
   };
 }

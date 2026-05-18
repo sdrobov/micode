@@ -1,6 +1,16 @@
 import type { PluginInput } from "@opencode-ai/plugin";
 
-// Error patterns we can recover from
+import {
+  type ContinuityHookConfig,
+  clearSessionContinuity,
+  formatResumeContinuityPrompt,
+  getContinuityAnchorBudget,
+  getSessionContinuityAnchor,
+  isContinuityAnchorActive,
+  mergeSessionContinuitySummary,
+  updateSessionContinuityProfile,
+} from "./continuity-anchor";
+
 const RECOVERABLE_ERRORS = {
   TOOL_RESULT_MISSING: "tool_result block(s) missing",
   THINKING_BLOCK_ORDER: "thinking blocks must be at the start",
@@ -16,6 +26,12 @@ interface RecoveryState {
   recoveryAttempts: Map<string, number>;
 }
 
+interface RecoveryContext {
+  ctx: PluginInput;
+  state: RecoveryState;
+  hookConfig?: ContinuityHookConfig;
+}
+
 const MAX_RECOVERY_ATTEMPTS = 3;
 const ABORT_SETTLE_DELAY_MS = 500;
 const RECOVERY_TOAST_DURATION_MS = 3000;
@@ -25,22 +41,19 @@ const ERROR_KEY_EXPIRY_MS = 10000;
 function extractErrorInfo(error: unknown): { message: string; messageIndex?: number } | null {
   if (!error) return null;
 
-  let errorStr: string;
+  let errorMessage = JSON.stringify(error);
   if (typeof error === "string") {
-    errorStr = error;
+    errorMessage = error;
   } else if (error instanceof Error) {
-    errorStr = error.message;
-  } else {
-    errorStr = JSON.stringify(error);
+    errorMessage = error.message;
   }
 
-  const errorLower = errorStr.toLowerCase();
+  const messageIndex = errorMessage.match(/messages?[.\s](\d+)/i)?.[1];
 
-  // Extract message index if present (e.g., "messages.5" or "message 5")
-  const indexMatch = errorStr.match(/messages?[.\s](\d+)/i);
-  const messageIndex = indexMatch ? parseInt(indexMatch[1], 10) : undefined;
-
-  return { message: errorLower, messageIndex };
+  return {
+    message: errorMessage.toLowerCase(),
+    messageIndex: messageIndex ? parseInt(messageIndex, 10) : undefined,
+  };
 }
 
 function identifyErrorType(errorMessage: string): RecoverableErrorType | null {
@@ -49,12 +62,8 @@ function identifyErrorType(errorMessage: string): RecoverableErrorType | null {
       return type as RecoverableErrorType;
     }
   }
-  return null;
-}
 
-interface RecoveryContext {
-  ctx: PluginInput;
-  state: RecoveryState;
+  return null;
 }
 
 async function getSessionMessages(rc: RecoveryContext, sessionID: string): Promise<unknown[]> {
@@ -80,6 +89,38 @@ async function abortSession(rc: RecoveryContext, sessionID: string): Promise<voi
   }
 }
 
+function extractLatestSummary(messages: readonly unknown[]): string | null {
+  const summaryMessage = [...messages].reverse().find((message) => {
+    const entry = message as Record<string, unknown>;
+    const info = entry.info as Record<string, unknown> | undefined;
+    return info?.role === "assistant" && info?.summary === true;
+  }) as Record<string, unknown> | undefined;
+  if (!summaryMessage) return null;
+
+  const parts = summaryMessage.parts as Array<{ type: string; text?: string }> | undefined;
+  if (!parts) return null;
+
+  const text = parts
+    .filter((part) => part.type === "text" && part.text)
+    .map((part) => part.text)
+    .join("\n\n");
+
+  return text.trim() || null;
+}
+
+function buildResumePrompt(rc: RecoveryContext, sessionID: string): string {
+  if (!isContinuityAnchorActive(sessionID)) {
+    return "Continue from where you left off.";
+  }
+
+  return formatResumeContinuityPrompt(
+    sessionID,
+    getSessionContinuityAnchor(sessionID),
+    getContinuityAnchorBudget(rc.hookConfig),
+    "Recover the session from this continuity anchor.",
+  );
+}
+
 async function resumeSession(
   rc: RecoveryContext,
   sessionID: string,
@@ -89,29 +130,22 @@ async function resumeSession(
 ): Promise<void> {
   try {
     const messages = await getSessionMessages(rc, sessionID);
-    const lastUserMsg = [...messages].reverse().find((m) => {
-      const msg = m as Record<string, unknown>;
-      const info = msg.info as Record<string, unknown> | undefined;
-      return info?.role === "user";
-    });
-
-    if (!lastUserMsg) return;
-
-    const parts = (lastUserMsg as Record<string, unknown>).parts as Array<{ type: string; text?: string }>;
-    const text = parts?.find((p) => p.type === "text")?.text;
-    if (!text) return;
+    const summaryText = extractLatestSummary(messages);
+    if (summaryText) {
+      mergeSessionContinuitySummary(sessionID, summaryText, getContinuityAnchorBudget(rc.hookConfig));
+    }
 
     await rc.ctx.client.session.prompt({
       path: { id: sessionID },
       body: {
-        parts: [{ type: "text", text: "Continue from where you left off." }],
+        parts: [{ type: "text", text: buildResumePrompt(rc, sessionID) }],
         ...(providerID && modelID ? { providerID, modelID } : {}),
         ...(agent ? { agent } : {}),
       },
       query: { directory: rc.ctx.directory },
     });
   } catch {
-    // Resume failed - user will need to manually continue
+    // Resume failed, user will need to continue manually
   }
 }
 
@@ -137,7 +171,6 @@ async function attemptRecovery(
 ): Promise<boolean> {
   const recoveryKey = `${sessionID}:${errorType}`;
   const attempts = rc.state.recoveryAttempts.get(recoveryKey) || 0;
-
   if (attempts >= MAX_RECOVERY_ATTEMPTS) {
     showToast(
       rc,
@@ -168,16 +201,22 @@ async function attemptRecovery(
 
 function cleanupSession(state: RecoveryState, sessionID: string): void {
   for (const key of state.recoveryAttempts.keys()) {
-    if (key.startsWith(`${sessionID}:`)) state.recoveryAttempts.delete(key);
+    if (key.startsWith(`${sessionID}:`)) {
+      state.recoveryAttempts.delete(key);
+    }
   }
+
   for (const key of state.processingErrors) {
-    if (key.startsWith(`${sessionID}:`)) state.processingErrors.delete(key);
+    if (key.startsWith(`${sessionID}:`)) {
+      state.processingErrors.delete(key);
+    }
   }
 }
 
 function deduplicateError(state: RecoveryState, sessionID: string, errorType: RecoverableErrorType): boolean {
   const errorKey = `${sessionID}:${errorType}`;
   if (state.processingErrors.has(errorKey)) return false;
+
   state.processingErrors.add(errorKey);
   setTimeout(() => state.processingErrors.delete(errorKey), ERROR_KEY_EXPIRY_MS);
   return true;
@@ -195,8 +234,7 @@ async function handleSessionError(rc: RecoveryContext, props: Record<string, unk
   if (!sessionID || !error) return;
 
   const errorType = classifyError(error);
-  if (!errorType) return;
-  if (!deduplicateError(rc.state, sessionID, errorType)) return;
+  if (!errorType || !deduplicateError(rc.state, sessionID, errorType)) return;
 
   await attemptRecovery(rc, sessionID, errorType);
 }
@@ -207,12 +245,13 @@ async function handleMessageError(rc: RecoveryContext, props: Record<string, unk
   const error = info?.error;
   if (!sessionID || !error) return;
 
-  const errorType = classifyError(error);
-  if (!errorType) return;
-  if (!deduplicateError(rc.state, sessionID, errorType)) return;
-
   const providerID = info.providerID as string | undefined;
   const modelID = info.modelID as string | undefined;
+  updateSessionContinuityProfile(sessionID, modelID ?? "", providerID ?? "", rc.hookConfig);
+
+  const errorType = classifyError(error);
+  if (!errorType || !deduplicateError(rc.state, sessionID, errorType)) return;
+
   const agent = info.agent as string | undefined;
   await attemptRecovery(rc, sessionID, errorType, providerID, modelID, agent);
 }
@@ -221,10 +260,11 @@ interface SessionRecoveryHooks {
   event: (input: { event: { type: string; properties?: unknown } }) => Promise<void>;
 }
 
-export function createSessionRecoveryHook(ctx: PluginInput): SessionRecoveryHooks {
+export function createSessionRecoveryHook(ctx: PluginInput, hookConfig?: ContinuityHookConfig): SessionRecoveryHooks {
   const rc: RecoveryContext = {
     ctx,
     state: { processingErrors: new Set(), recoveryAttempts: new Map() },
+    hookConfig,
   };
 
   return {
@@ -233,12 +273,20 @@ export function createSessionRecoveryHook(ctx: PluginInput): SessionRecoveryHook
 
       if (event.type === "session.deleted") {
         const sessionInfo = props?.info as { id?: string } | undefined;
-        if (sessionInfo?.id) cleanupSession(rc.state, sessionInfo.id);
+        if (!sessionInfo?.id) return;
+
+        cleanupSession(rc.state, sessionInfo.id);
+        clearSessionContinuity(sessionInfo.id);
         return;
       }
 
-      if (event.type === "session.error") await handleSessionError(rc, props);
-      if (event.type === "message.updated") await handleMessageError(rc, props);
+      if (event.type === "session.error") {
+        await handleSessionError(rc, props);
+      }
+
+      if (event.type === "message.updated") {
+        await handleMessageError(rc, props);
+      }
     },
   };
 }

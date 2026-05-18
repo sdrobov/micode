@@ -23,13 +23,17 @@ describe("context-budget", () => {
       expect(hook).toHaveProperty("event");
       expect(hook).toHaveProperty("estimateReadCost");
       expect(hook).toHaveProperty("canRead");
+      expect(hook).toHaveProperty("assessFanout");
       expect(hook).toHaveProperty("getBudget");
+      expect(hook).toHaveProperty("getOutputGovernorState");
     });
   });
 
   describe("event handler - message.updated", () => {
     it("should track token usage from message.updated events", async () => {
-      hook = createContextBudgetHook(createMockCtx());
+      hook = createContextBudgetHook(createMockCtx(), {
+        modelContextLimits: new Map([["anthropic/claude-sonnet", 200_000]]),
+      });
 
       await hook.event({
         event: {
@@ -176,6 +180,253 @@ describe("context-budget", () => {
       const s2Budget = hook.getBudget("s2");
       expect(s1Budget?.used).toBe(30_000);
       expect(s2Budget?.used).toBe(5_000);
+    });
+  });
+
+  describe("getOutputGovernorState", () => {
+    it("should activate for explicitly enabled small-context mode", () => {
+      hook = createContextBudgetHook(createMockCtx(), {
+        defaultContextLimit: 12_000,
+        charPerToken: 1,
+        smallContext: {
+          mode: "on",
+          autoThreshold: 8_000,
+          continuityAnchor: { enabled: true, budgetTokens: 900 },
+          outputGovernor: { enabled: true, reserveTokens: 2_000 },
+          promptBudgeting: { enabled: true, maxPromptRatio: 0.5, reserveTokens: 4_000 },
+        },
+      });
+
+      const state = hook.getOutputGovernorState("session-1");
+
+      expect(state.active).toBe(true);
+      expect(state.availableTokens).toBe(10_000);
+      expect(state.reason).toBe("active");
+    });
+
+    it("should auto-activate for known small-context models", async () => {
+      hook = createContextBudgetHook(createMockCtx(), {
+        charPerToken: 1,
+        smallContext: {
+          mode: "auto",
+          autoThreshold: 96_000,
+          continuityAnchor: { enabled: true, budgetTokens: 900 },
+          outputGovernor: { enabled: true, reserveTokens: 4_000 },
+          promptBudgeting: { enabled: true, maxPromptRatio: 0.5, reserveTokens: 4_000 },
+        },
+        modelContextLimits: new Map([["custom/model-a", 64_000]]),
+      });
+
+      await hook.event({
+        event: {
+          type: "message.updated",
+          properties: {
+            info: {
+              sessionID: "session-1",
+              role: "assistant",
+              tokens: { input: 10_000 },
+              modelID: "model-a",
+              providerID: "custom",
+            },
+          },
+        } as any,
+      });
+
+      const state = hook.getOutputGovernorState("session-1");
+
+      expect(state.active).toBe(true);
+      expect(state.availableTokens).toBe(50_000);
+    });
+
+    it("should stay inactive for unknown models in auto mode", async () => {
+      hook = createContextBudgetHook(createMockCtx(), {
+        defaultContextLimit: 64_000,
+        charPerToken: 1,
+        smallContext: {
+          mode: "auto",
+          autoThreshold: 256_000,
+          continuityAnchor: { enabled: true, budgetTokens: 900 },
+          outputGovernor: { enabled: true, reserveTokens: 4_000 },
+          promptBudgeting: { enabled: true, maxPromptRatio: 0.5, reserveTokens: 4_000 },
+        },
+      });
+
+      await hook.event({
+        event: {
+          type: "message.updated",
+          properties: {
+            info: {
+              sessionID: "session-1",
+              role: "assistant",
+              tokens: { input: 10_000 },
+              modelID: "mystery-model",
+              providerID: "custom",
+            },
+          },
+        } as any,
+      });
+
+      const state = hook.getOutputGovernorState("session-1");
+
+      expect(state.active).toBe(false);
+      expect(state.reason).toBe("unknown_model");
+    });
+
+    it("should stay inactive for known large-context models in auto mode", async () => {
+      hook = createContextBudgetHook(createMockCtx(), {
+        charPerToken: 1,
+        modelContextLimits: new Map([["anthropic/claude-sonnet", 200_000]]),
+        smallContext: {
+          mode: "auto",
+          autoThreshold: 96_000,
+          continuityAnchor: { enabled: true, budgetTokens: 900 },
+          outputGovernor: { enabled: true, reserveTokens: 4_000 },
+          promptBudgeting: { enabled: true, maxPromptRatio: 0.5, reserveTokens: 4_000 },
+        },
+      });
+
+      await hook.event({
+        event: {
+          type: "message.updated",
+          properties: {
+            info: {
+              sessionID: "session-1",
+              role: "assistant",
+              tokens: { input: 10_000 },
+              modelID: "claude-sonnet",
+              providerID: "anthropic",
+            },
+          },
+        } as any,
+      });
+
+      const state = hook.getOutputGovernorState("session-1");
+
+      expect(state.active).toBe(false);
+      expect(state.reason).toBe("non_small_context");
+    });
+
+    it("should activate for unknown models when a context override is configured", async () => {
+      hook = createContextBudgetHook(createMockCtx(), {
+        charPerToken: 1,
+        smallContext: {
+          mode: "auto",
+          autoThreshold: 96_000,
+          contextLimitOverride: 64_000,
+          continuityAnchor: { enabled: true, budgetTokens: 900 },
+          outputGovernor: { enabled: true, reserveTokens: 4_000 },
+          promptBudgeting: { enabled: true, maxPromptRatio: 0.5, reserveTokens: 4_000 },
+        },
+      });
+
+      await hook.event({
+        event: {
+          type: "message.updated",
+          properties: {
+            info: {
+              sessionID: "session-override",
+              role: "assistant",
+              tokens: { input: 10_000 },
+              modelID: "mystery-model",
+              providerID: "custom",
+            },
+          },
+        } as any,
+      });
+
+      const state = hook.getOutputGovernorState("session-override");
+
+      expect(state.active).toBe(true);
+      expect(state.availableTokens).toBe(50_000);
+      expect(state.reason).toBe("active");
+    });
+  });
+
+  describe("assessFanout", () => {
+    it("should recommend fanout for broad multi-file work in small-context mode", async () => {
+      hook = createContextBudgetHook(createMockCtx(), {
+        defaultContextLimit: 32_000,
+        smallContext: {
+          mode: "on",
+          autoThreshold: 96_000,
+          continuityAnchor: { enabled: true, budgetTokens: 900 },
+          outputGovernor: { enabled: true, reserveTokens: 2_000 },
+          promptBudgeting: { enabled: true, maxPromptRatio: 0.5, reserveTokens: 4_000 },
+        },
+      });
+
+      const result = await hook.assessFanout("session-1", {
+        files: ["a.ts", "b.ts", "c.ts", "d.ts"],
+        expectedToolCalls: 5,
+        plannedTools: ["Glob", "Grep", "Read"],
+        investigationType: "broad_exploration",
+      });
+
+      expect(result.active).toBe(true);
+      expect(result.decision).toBe("fanout_required");
+      expect(result.reasons).toContain("investigation spans 4 files");
+    });
+
+    it("should stay direct for non-small-context sessions", async () => {
+      hook = createContextBudgetHook(createMockCtx(), {
+        modelContextLimits: new Map([["anthropic/claude-sonnet", 200_000]]),
+        smallContext: {
+          mode: "auto",
+          autoThreshold: 96_000,
+          continuityAnchor: { enabled: true, budgetTokens: 900 },
+          outputGovernor: { enabled: true, reserveTokens: 2_000 },
+          promptBudgeting: { enabled: true, maxPromptRatio: 0.5, reserveTokens: 4_000 },
+        },
+      });
+
+      await hook.event({
+        event: {
+          type: "message.updated",
+          properties: {
+            info: {
+              sessionID: "session-large",
+              role: "assistant",
+              tokens: { input: 10_000 },
+              modelID: "claude-sonnet",
+              providerID: "anthropic",
+            },
+          },
+        } as any,
+      });
+
+      const result = await hook.assessFanout("session-large", {
+        files: ["a.ts", "b.ts", "c.ts", "d.ts"],
+        expectedToolCalls: 5,
+        plannedTools: ["Glob", "Grep", "Read"],
+        investigationType: "broad_exploration",
+      });
+
+      expect(result.active).toBe(false);
+      expect(result.decision).toBe("direct_ok");
+    });
+
+    it("should require fanout after compaction for a broad resume investigation", async () => {
+      hook = createContextBudgetHook(createMockCtx(), {
+        defaultContextLimit: 32_000,
+        smallContext: {
+          mode: "on",
+          autoThreshold: 96_000,
+          continuityAnchor: { enabled: true, budgetTokens: 900 },
+          outputGovernor: { enabled: true, reserveTokens: 2_000 },
+          promptBudgeting: { enabled: true, maxPromptRatio: 0.5, reserveTokens: 4_000 },
+        },
+      });
+
+      const result = await hook.assessFanout("session-1", {
+        files: ["a.ts", "b.ts"],
+        expectedToolCalls: 3,
+        plannedTools: ["Glob", "Read", "look_at"],
+        continuingAfterCompaction: true,
+        investigationType: "architecture_trace",
+      });
+
+      expect(result.decision).toBe("fanout_required");
+      expect(result.reasons).toContain("this is the first broad investigation after compaction or resume");
     });
   });
 });

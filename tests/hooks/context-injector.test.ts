@@ -72,5 +72,62 @@ describe("context-injector", () => {
       // Should NOT have injected context
       expect(output.output).not.toContain("directory-context");
     });
+
+    it("should invalidate cached context files after edits", async () => {
+      const readmePath = join(testDir, "README.md");
+      writeFileSync(readmePath, "# Project\n\nVersion one");
+
+      const { createContextInjectorHook } = await import("../../src/hooks/context-injector");
+      const ctx = createMockCtx(testDir);
+      const hooks = createContextInjectorHook(ctx as any);
+
+      const first = { system: "Base prompt" };
+      await hooks["chat.params"]({ sessionID: "session-a" }, first);
+      expect(first.system).toContain("Version one");
+
+      writeFileSync(readmePath, "# Project\n\nVersion two");
+      await hooks["tool.execute.after"]({ tool: "Edit", args: { filePath: readmePath } }, { output: "updated" });
+
+      const second = { system: "Base prompt" };
+      await hooks["chat.params"]({ sessionID: "session-a" }, second);
+      expect(second.system).toContain("Version two");
+      expect(second.system).not.toContain("Version one");
+    });
+  });
+
+  describe("chat.params hook", () => {
+    it("should budget project context in small-context mode", async () => {
+      writeFileSync(join(testDir, "README.md"), "A".repeat(800));
+      writeFileSync(join(testDir, "ARCHITECTURE.md"), "B".repeat(800));
+      writeFileSync(join(testDir, "CODE_STYLE.md"), "C".repeat(800));
+
+      const { createContextInjectorHook } = await import("../../src/hooks/context-injector");
+      const { createPromptBudgetController } = await import("../../src/hooks/prompt-budgeting");
+      const { parseSmallContextConfig } = await import("../../src/config-schemas");
+      const smallContext = parseSmallContextConfig({
+        mode: "on",
+        autoThreshold: 400,
+        promptBudgeting: {
+          maxPromptRatio: 0.4,
+          reserveTokens: 40,
+        },
+      });
+
+      const ctx = createMockCtx(testDir);
+      const hooks = createContextInjectorHook(ctx as any, {
+        promptBudget: createPromptBudgetController({ smallContext }),
+      });
+
+      const output = {
+        system: `Base prompt ${"Z".repeat(200)}`,
+        options: {},
+      };
+
+      await hooks["chat.params"]({ sessionID: "session-budget" }, output);
+
+      expect(output.system).toContain("project-context");
+      expect(output.system).toContain("Context trimmed for small-context prompt budget");
+      expect(output.system).toContain("context-summary");
+    });
   });
 });

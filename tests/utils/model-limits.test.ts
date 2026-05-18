@@ -1,7 +1,16 @@
 // tests/utils/model-limits.test.ts
 import { describe, expect, it } from "bun:test";
 
-import { DEFAULT_CONTEXT_LIMIT, getContextLimit, MODEL_CONTEXT_LIMITS } from "../../src/utils/model-limits";
+import {
+  CONTEXT_LIMIT_SOURCES,
+  DEFAULT_CONTEXT_LIMIT,
+  getContextLimit,
+  isSmallContextLimit,
+  isSmallContextModel,
+  MODEL_CONTEXT_LIMITS,
+  resolveContextLimit,
+  SMALL_CONTEXT_AUTO_THRESHOLD,
+} from "../../src/utils/model-limits";
 
 describe("model-limits", () => {
   describe("getContextLimit without loaded limits", () => {
@@ -18,6 +27,66 @@ describe("model-limits", () => {
 
     it("should return default for unknown model", () => {
       expect(getContextLimit("unknown-model")).toBe(DEFAULT_CONTEXT_LIMIT);
+    });
+  });
+
+  describe("resolveContextLimit", () => {
+    it("should prefer the small-context override", () => {
+      const resolution = resolveContextLimit({
+        modelID: "model-a",
+        providerID: "custom",
+        modelContextLimits: new Map([["custom/model-a", 96_000]]),
+        localContextLimit: 64_000,
+        smallContext: { contextLimitOverride: 32_000 },
+      });
+
+      expect(resolution).toEqual({
+        limit: 32_000,
+        source: CONTEXT_LIMIT_SOURCES.smallContextOverride,
+        resolved: true,
+      });
+    });
+
+    it("should prefer the local LLM context limit over opencode limits", () => {
+      const resolution = resolveContextLimit({
+        modelID: "model-a",
+        providerID: "custom",
+        modelContextLimits: new Map([["custom/model-a", 96_000]]),
+        localContextLimit: 64_000,
+      });
+
+      expect(resolution).toEqual({
+        limit: 64_000,
+        source: CONTEXT_LIMIT_SOURCES.localLLM,
+        resolved: true,
+      });
+    });
+
+    it("should resolve exact opencode limits without pattern guessing", () => {
+      const resolution = resolveContextLimit({
+        modelID: "model-a",
+        providerID: "custom",
+        modelContextLimits: new Map([["custom/model-a", 96_000]]),
+      });
+
+      expect(resolution).toEqual({
+        limit: 96_000,
+        source: CONTEXT_LIMIT_SOURCES.opencode,
+        resolved: true,
+      });
+    });
+
+    it("should stay unresolved for unknown models without overrides", () => {
+      const resolution = resolveContextLimit({
+        modelID: "gpt-4o",
+        providerID: "openai",
+      });
+
+      expect(resolution).toEqual({
+        limit: null,
+        source: CONTEXT_LIMIT_SOURCES.unresolved,
+        resolved: false,
+      });
     });
   });
 
@@ -86,6 +155,31 @@ describe("model-limits", () => {
   describe("DEFAULT_CONTEXT_LIMIT", () => {
     it("should be 200_000", () => {
       expect(DEFAULT_CONTEXT_LIMIT).toBe(200_000);
+    });
+  });
+
+  describe("isSmallContextLimit", () => {
+    it("should treat limits at or below the threshold as small-context", () => {
+      expect(isSmallContextLimit(64_000)).toBe(true);
+      expect(isSmallContextLimit(SMALL_CONTEXT_AUTO_THRESHOLD)).toBe(true);
+      expect(isSmallContextLimit(200_000)).toBe(false);
+    });
+  });
+
+  describe("isSmallContextModel", () => {
+    it("should detect known 128k models as small-context", () => {
+      expect(isSmallContextModel("gpt-4o")).toBe(true);
+    });
+
+    it("should use loaded limits for custom thresholds", () => {
+      const loadedLimits = new Map([["custom/model-a", 64_000]]);
+
+      expect(isSmallContextModel("model-a", "custom", loadedLimits)).toBe(true);
+      expect(isSmallContextModel("model-a", "custom", loadedLimits, 32_000)).toBe(false);
+    });
+
+    it("should keep unknown models out of small-context mode by default", () => {
+      expect(isSmallContextModel("unknown-model")).toBe(false);
     });
   });
 });

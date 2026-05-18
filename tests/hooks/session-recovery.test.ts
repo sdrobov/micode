@@ -1,8 +1,39 @@
-import { describe, expect, it } from "bun:test";
+import { beforeEach, describe, expect, it } from "bun:test";
 
+import type { ContinuityHookConfig } from "../../src/hooks/continuity-anchor";
+import {
+  mergeSessionContinuityAnchor,
+  resetContinuityRegistry,
+  updateSessionContinuityProfile,
+} from "../../src/hooks/continuity-anchor";
 import { createSessionRecoveryHook } from "../../src/hooks/session-recovery";
 
+const SMALL_CONTEXT_CONFIG: ContinuityHookConfig = {
+  smallContext: {
+    mode: "auto",
+    autoThreshold: 128_000,
+    continuityAnchor: {
+      enabled: true,
+      budgetTokens: 120,
+    },
+    outputGovernor: {
+      enabled: true,
+      reserveTokens: 4_096,
+    },
+    promptBudgeting: {
+      enabled: true,
+      maxPromptRatio: 0.7,
+      reserveTokens: 8_192,
+    },
+  },
+  modelContextLimits: new Map([["openai/gpt-4o", 64_000]]),
+};
+
 describe("session-recovery", () => {
+  beforeEach(() => {
+    resetContinuityRegistry();
+  });
+
   function createMockCtx(overrides?: Record<string, unknown>) {
     return {
       directory: "/test",
@@ -277,6 +308,88 @@ describe("session-recovery", () => {
 
       await new Promise((resolve) => setTimeout(resolve, 600));
       expect(abortCalled).toBe(true);
+    });
+
+    it("should resume from the continuity anchor for small-context sessions", async () => {
+      const promptTexts: string[] = [];
+      const ctx = createMockCtx({
+        client: {
+          session: {
+            abort: async () => {},
+            messages: async () => ({
+              data: [
+                {
+                  info: { role: "assistant", summary: true },
+                  parts: [
+                    {
+                      type: "text",
+                      text: `# Session Summary
+
+## Goal
+Preserve continuity
+
+## Constraints & Preferences
+- Stay scoped
+
+## Progress
+### Done
+- [x] Captured corrected plan
+
+### In Progress
+- [ ] Resume session recovery
+
+### Blocked
+- (none)
+
+## Key Decisions
+- **Keep accepted plan**: Do not restart
+
+## Next Steps
+1. Finish session recovery
+2. Update tests
+
+## Critical Context
+- Continue the corrected plan`,
+                    },
+                  ],
+                },
+              ],
+            }),
+            prompt: async ({ body }: { body: { parts: Array<{ text: string }> } }) => {
+              promptTexts.push(body.parts[0].text);
+            },
+          },
+          tui: { showToast: async () => {} },
+        },
+      });
+
+      mergeSessionContinuityAnchor("s1", {
+        goal: "Preserve continuity",
+        acceptedPlan: "Keep ledger-loader clean first, then adjust recovery",
+      });
+      updateSessionContinuityProfile("s1", "gpt-4o", "openai", SMALL_CONTEXT_CONFIG);
+
+      const hook = createSessionRecoveryHook(ctx, SMALL_CONTEXT_CONFIG);
+
+      await hook.event({
+        event: {
+          type: "message.updated",
+          properties: {
+            info: {
+              sessionID: "s1",
+              error: "tool_result must follow tool_use",
+              providerID: "openai",
+              modelID: "gpt-4o",
+            },
+          },
+        },
+      });
+
+      await new Promise((resolve) => setTimeout(resolve, 600));
+      expect(promptTexts).toHaveLength(1);
+      expect(promptTexts[0]).toContain("<continuity-anchor");
+      expect(promptTexts[0]).toContain("Accepted plan: Keep ledger-loader clean first");
+      expect(promptTexts[0]).toContain("Current step: Resume session recovery");
     });
   });
 

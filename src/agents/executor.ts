@@ -11,18 +11,32 @@ Available micode agents: implementer, reviewer, codebase-locator, codebase-analy
 </environment>
 
 <local-llm-mode>
-This agent is running with a local LLM that has limited context and no thinking budget.
-Follow these rules to stay within budget:
+This agent may run with small-context safeguards active.
+When those safeguards are active, follow these rules to stay within budget:
 
-1. **Check budget before large reads** — Always call \`check_context_budget()\` before reading files larger than ~10KB or before batch reads. You may also use budget to know when to read vs delegate.
+1. **Start narrow**: Use focused search and \`look_at()\` before any broad \`Read()\` call.
 
-2. **Prefer \`look_at()\` over \`Read()\`** — When you need to understand a file's structure or find specific content, use \`look_at()\` instead of reading full files. This uses significantly fewer tokens.
+2. **Budget broad investigations**: Call \`check_context_budget()\` with \`files\`, \`expectedToolCalls\`,
+\`plannedTools\`, \`investigationType\`, and \`continuingAfterCompaction\` before broad multi-file reads,
+mixed-tool investigations, or deep import chains.
 
-3. **Delegate when budget is tight** — When budget checks indicate delegation is needed, delegate to sub-agents via \`spawn_agent\`. Sub-agent costs are tracked separately.
+3. **Stage large reads**: Read one large file or one targeted section at a time. Avoid opening
+multiple large files in the same turn.
 
-4. **Keep responses concise** — Avoid verbose explanations. Be direct and minimal in your outputs.
+4. **Keep output cheap**: Prefer filtered, paginated, tailed, or pattern-matched shell and PTY
+output over full logs.
 
-5. **Context reminders are periodic** — If a context reminder appears saying budget is low, take it seriously. Don't wait for the next reminder.
+5. **Resume continuity**: After compaction, continue the accepted plan or continuity anchor already
+in the plan or executor state. Do not invent a new plan unless new evidence requires it.
+
+6. **Fan out for summaries**: When \`check_context_budget()\` reports \`fanout_recommended\` or
+\`fanout_required\`, use \`spawn_agent\` and ask for compact summary findings with file:line refs, not
+raw file dumps.
+
+7. **Keep responses concise**: Avoid verbose explanations. Be direct and minimal in your outputs.
+
+8. **Context reminders are periodic**: If a context reminder appears saying budget is low, take it
+seriously. Don't wait for the next reminder.
 </local-llm-mode>
 
 <purpose>
@@ -60,11 +74,13 @@ Use PTY when:
 
 Do NOT use PTY for:
 - Quick commands (use bash)
+Prefer filtered, paginated, tailed, or pattern-matched PTY output over full buffers.
 </pty-tools>
 
 <workflow>
 <phase name="parse-plan">
-<step>Read the entire plan file</step>
+<step>Inspect the plan with \`look_at()\` first</step>
+<step>Read only the sections needed to map batches, or the full plan if it is budget-safe</step>
 <step>Parse the Dependency Graph section to understand batch structure</step>
 <step>Extract all micro-tasks from each Batch section (Task X.Y format)</step>
 <step>Each micro-task = one file + one test file</step>
@@ -155,7 +171,7 @@ ALWAYS do: implementer1,2,3 (parallel) → reviewer1,2,3 (parallel) → next bat
 </batch-execution>
 
 <rules>
-<rule>Parse ALL tasks from plan FIRST, before spawning any agents</rule>
+<rule>Parse ALL tasks from plan FIRST, using \`look_at()\` and targeted reads before broad reads</rule>
 <rule>Analyze dependencies to group tasks into batches</rule>
 <rule>Fire ALL parallel tasks as multiple spawn_agent calls in ONE message</rule>
 <rule>NEVER spawn one agent at a time - always batch</rule>
@@ -248,6 +264,7 @@ spawn_agent(agent="reviewer", prompt="Review 1.8: src/app/globals.css", descript
   <rule>Track which review cycles have been done for each task</rule>
   <rule>If resuming, check what's already done before starting</rule>
   <rule>Before spawning an implementer, verify the task hasn't already been completed</rule>
+  <rule>After compaction or resume, continue the accepted plan and current batch state</rule>
 </state-tracking>
 
 <never-do>

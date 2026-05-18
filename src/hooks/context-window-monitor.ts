@@ -1,14 +1,16 @@
 import type { PluginInput } from "@opencode-ai/plugin";
+import type { SmallContextConfig } from "@/config-schemas";
 
 import { config } from "@/utils/config";
-import { getContextLimit } from "@/utils/model-limits";
+import { resolveContextLimit } from "@/utils/model-limits";
 
 const PERCENT_MULTIPLIER = 100;
 const TOKENS_PER_KILOTOKEN = 1000;
 
 export interface ContextWindowMonitorConfig {
-  /** Model context limits loaded from opencode.json */
-  modelContextLimits?: Map<string, number>;
+  readonly modelContextLimits?: Map<string, number>;
+  readonly localContextLimit?: number;
+  readonly smallContext?: SmallContextConfig | null;
 }
 
 interface MonitorState {
@@ -28,7 +30,6 @@ export function createContextWindowMonitorHook(
   ctx: PluginInput,
   hookConfig?: ContextWindowMonitorConfig,
 ): ContextWindowMonitorHooks {
-  const modelLimits = hookConfig?.modelContextLimits;
   const state: MonitorState = {
     lastWarningTime: new Map(),
     lastUsageRatio: new Map(),
@@ -53,7 +54,7 @@ export function createContextWindowMonitorHook(
       }
 
       if (event.type === "message.updated") {
-        await handleMessageUpdated(ctx, state, modelLimits, props);
+        await handleMessageUpdated(ctx, state, hookConfig, props);
       }
     },
   };
@@ -85,7 +86,7 @@ function handleSessionDeleted(state: MonitorState, props: Record<string, unknown
 async function handleMessageUpdated(
   ctx: PluginInput,
   state: MonitorState,
-  modelLimits: Map<string, number> | undefined,
+  hookConfig: ContextWindowMonitorConfig | undefined,
   props: Record<string, unknown> | undefined,
 ): Promise<void> {
   const info = props?.info as Record<string, unknown> | undefined;
@@ -99,13 +100,23 @@ async function handleMessageUpdated(
 
   const modelID = (info.modelID as string) || "";
   const providerID = (info.providerID as string) || "";
-  const contextLimit = getContextLimit(modelID, providerID, modelLimits);
-  const usageRatio = totalUsed / contextLimit;
+  const resolution = resolveContextLimit({
+    modelID,
+    providerID,
+    modelContextLimits: hookConfig?.modelContextLimits,
+    localContextLimit: hookConfig?.localContextLimit,
+    smallContext: hookConfig?.smallContext,
+  });
+  if (!resolution.resolved || resolution.limit === null) {
+    state.lastUsageRatio.delete(sessionID);
+    return;
+  }
+  const usageRatio = totalUsed / resolution.limit;
 
   state.lastUsageRatio.set(sessionID, usageRatio);
 
   if (usageRatio < config.contextWindow.warningThreshold) return;
-  await maybeShowToast(ctx, state, sessionID, usageRatio, totalUsed, contextLimit);
+  await maybeShowToast(ctx, state, sessionID, usageRatio, totalUsed, resolution.limit);
 }
 
 async function maybeShowToast(

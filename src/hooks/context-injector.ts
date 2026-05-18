@@ -4,9 +4,15 @@ import { dirname, join, resolve } from "node:path";
 import type { PluginInput } from "@opencode-ai/plugin";
 
 import { config } from "@/utils/config";
+import type { PromptBudgetController, PromptBudgetEntry } from "./prompt-budgeting";
+import { estimatePromptTokens, selectPromptBudgetEntries, truncatePromptText } from "./prompt-budgeting";
 
 // Tools that trigger directory-aware context injection
 const FILE_ACCESS_TOOLS = ["Read", "read", "Edit", "edit"];
+const CACHE_INVALIDATION_TOOLS = ["Edit", "edit", "Write", "write"];
+const CONTEXT_TRUNCATION_SUFFIX = "\n\n[Context trimmed for small-context prompt budget]";
+const CONTEXT_OMISSION_TEMPLATE =
+  '<context-summary omitted="%COUNT%">Additional context files omitted for small-context prompt budget.</context-summary>';
 
 // Cache for file contents
 interface ContextCache {
@@ -21,12 +27,73 @@ interface ContextInjectorHooks {
     output: { options?: Record<string, unknown>; system?: string },
   ) => Promise<void>;
   "tool.execute.after": (
-    input: { tool: string; args?: Record<string, unknown> },
+    input: { tool: string; sessionID?: string; args?: Record<string, unknown> },
     output: { output?: string },
   ) => Promise<void>;
 }
 
-export function createContextInjectorHook(ctx: PluginInput): ContextInjectorHooks {
+export interface ContextInjectorConfig {
+  readonly promptBudget?: PromptBudgetController;
+}
+
+interface ContextFile {
+  readonly filename: string;
+  readonly content: string;
+}
+
+function createChatParamsHandler(
+  loadRootContextFiles: () => Promise<Map<string, string>>,
+  promptBudget?: PromptBudgetController,
+): ContextInjectorHooks["chat.params"] {
+  return async (input, output) => {
+    const files = await loadRootContextFiles();
+    if (files.size === 0) return;
+
+    const contextBlock = formatBudgetedContextBlock(files, "project-context", {
+      existingText: output.system,
+      options: output.options,
+      promptBudget,
+      sessionID: input.sessionID,
+    });
+    if (!contextBlock) return;
+    output.system = output.system ? output.system + contextBlock : contextBlock;
+  };
+}
+
+function createToolExecuteHandler(
+  projectRoot: string,
+  cache: ContextCache,
+  walkUpForContextFiles: (filePath: string) => Promise<Map<string, string>>,
+  promptBudget?: PromptBudgetController,
+): ContextInjectorHooks["tool.execute.after"] {
+  return async (input, output) => {
+    const filePath = getToolFilePath(input.args);
+    if (!filePath) return;
+
+    if (CACHE_INVALIDATION_TOOLS.includes(input.tool)) {
+      invalidateContextCache(projectRoot, cache, filePath);
+    }
+
+    if (!FILE_ACCESS_TOOLS.includes(input.tool)) return;
+
+    try {
+      const directoryFiles = await walkUpForContextFiles(filePath);
+      if (directoryFiles.size === 0) return;
+
+      const contextBlock = formatBudgetedContextBlock(directoryFiles, "directory-context", {
+        existingText: output.output,
+        promptBudget,
+        sessionID: input.sessionID,
+      });
+      if (!contextBlock || !output.output) return;
+      output.output = output.output + contextBlock;
+    } catch {
+      // Ignore errors in context injection
+    }
+  };
+}
+
+export function createContextInjectorHook(ctx: PluginInput, hookConfig?: ContextInjectorConfig): ContextInjectorHooks {
   const cache: ContextCache = {
     rootContent: new Map(),
     directoryContent: new Map(),
@@ -38,28 +105,13 @@ export function createContextInjectorHook(ctx: PluginInput): ContextInjectorHook
     walkUpForContext(ctx, cache, filePath);
 
   return {
-    "chat.params": async (_input, output) => {
-      const files = await loadRootContextFiles();
-      if (files.size === 0) return;
-      const contextBlock = formatContextBlock(files, "project-context");
-      output.system = output.system ? output.system + contextBlock : contextBlock;
-    },
-
-    "tool.execute.after": async (input, output) => {
-      if (!FILE_ACCESS_TOOLS.includes(input.tool)) return;
-      const filePath = input.args?.filePath as string | undefined;
-      if (!filePath) return;
-      try {
-        const directoryFiles = await walkUpForContextFiles(filePath);
-        if (directoryFiles.size === 0) return;
-        const contextBlock = formatContextBlock(directoryFiles, "directory-context");
-        if (output.output) {
-          output.output = output.output + contextBlock;
-        }
-      } catch {
-        // Ignore errors in context injection
-      }
-    },
+    "chat.params": createChatParamsHandler(loadRootContextFiles, hookConfig?.promptBudget),
+    "tool.execute.after": createToolExecuteHandler(
+      ctx.directory,
+      cache,
+      walkUpForContextFiles,
+      hookConfig?.promptBudget,
+    ),
   };
 }
 
@@ -137,11 +189,104 @@ function evictOldestIfNeeded(cache: ContextCache): void {
   if (firstKey) cache.directoryContent.delete(firstKey);
 }
 
-function formatContextBlock(files: Map<string, string>, label: string): string {
+function getToolFilePath(args?: Record<string, unknown>): string | undefined {
+  const filePath = args?.filePath;
+  if (typeof filePath === "string") return filePath;
+  const snakeCaseFilePath = args?.file_path;
+  return typeof snakeCaseFilePath === "string" ? snakeCaseFilePath : undefined;
+}
+
+function clearDirectoryCache(cache: ContextCache, directory: string): void {
+  for (const cacheKey of [...cache.directoryContent.keys()]) {
+    if (cacheKey === directory || cacheKey.startsWith(`${directory}/`)) {
+      cache.directoryContent.delete(cacheKey);
+    }
+  }
+}
+
+function invalidateContextCache(projectRoot: string, cache: ContextCache, filePath: string): void {
+  const resolvedPath = resolve(filePath);
+  const resolvedRoot = resolve(projectRoot);
+  if (resolvedPath !== resolvedRoot && !resolvedPath.startsWith(`${resolvedRoot}/`)) return;
+
+  const rootFiles = new Set(config.paths.rootContextFiles);
+  if (rootFiles.has(resolvedPath.replace(`${resolvedRoot}/`, ""))) {
+    cache.rootContent.clear();
+    cache.lastRootCheck = 0;
+  }
+
+  const contextFiles = new Set(config.paths.dirContextFiles);
+  const filename = resolvedPath.split("/").pop();
+  if (!filename || !contextFiles.has(filename)) return;
+  clearDirectoryCache(cache, dirname(resolvedPath));
+}
+
+function formatSingleContextBlock(file: ContextFile): string {
+  return `<context file="${file.filename}">\n${file.content}\n</context>`;
+}
+
+function formatOmissionSummary(omittedCount: number): string {
+  return CONTEXT_OMISSION_TEMPLATE.replace("%COUNT%", String(omittedCount));
+}
+
+function toContextEntries(files: Map<string, string>): PromptBudgetEntry<ContextFile>[] {
+  return [...files.entries()].map(([filename, content], index) => ({
+    value: { filename, content },
+    text: formatSingleContextBlock({ filename, content }),
+    priority: index,
+    dedupeKey: content,
+  }));
+}
+
+function truncateContextEntry(
+  entry: PromptBudgetEntry<ContextFile>,
+  remainingTokens: number,
+): PromptBudgetEntry<ContextFile> | null {
+  const wrapperTokens = estimatePromptTokens(formatSingleContextBlock({ ...entry.value, content: "" }));
+  const content = truncatePromptText(entry.value.content, remainingTokens - wrapperTokens, CONTEXT_TRUNCATION_SUFFIX);
+  if (!content) return null;
+
+  const value = { ...entry.value, content };
+  return { ...entry, value, text: formatSingleContextBlock(value) };
+}
+
+function formatBudgetedContextBlock(
+  files: Map<string, string>,
+  label: string,
+  options: {
+    readonly existingText?: string;
+    readonly options?: Record<string, unknown>;
+    readonly promptBudget?: PromptBudgetController;
+    readonly sessionID?: string;
+  },
+): string {
   if (files.size === 0) return "";
+
+  const remainingTokens = options.promptBudget?.getRemainingTokens({
+    existingText: options.existingText,
+    options: options.options,
+    sessionID: options.sessionID,
+  });
+  if (remainingTokens == null) {
+    return formatContextBlock(
+      [...files.entries()].map(([filename, content]) => ({ filename, content })),
+      label,
+    );
+  }
+
+  const selection = selectPromptBudgetEntries(toContextEntries(files), remainingTokens, truncateContextEntry);
+  if (selection.values.length === 0) return "";
+  return formatContextBlock(selection.values, label, selection.omittedCount);
+}
+
+function formatContextBlock(files: readonly ContextFile[], label: string, omittedCount = 0): string {
+  if (files.length === 0) return "";
   const blocks: string[] = [];
-  for (const [filename, content] of files) {
-    blocks.push(`<context file="${filename}">\n${content}\n</context>`);
+  for (const file of files) {
+    blocks.push(formatSingleContextBlock(file));
+  }
+  if (omittedCount > 0) {
+    blocks.push(formatOmissionSummary(omittedCount));
   }
   return `\n<${label}>\n${blocks.join("\n\n")}\n</${label}>\n`;
 }

@@ -126,6 +126,21 @@ Create `~/.config/opencode/micode.json` for micode-specific settings:
     "toolLoopThreshold": 3,
     "toolLoopMaxInterventions": 1
   },
+  "smallContext": {
+    "mode": "auto",
+    "autoThreshold": 128000,
+    "contextLimitOverride": 64000,
+    "continuityAnchor": {
+      "budgetTokens": 1200
+    },
+    "outputGovernor": {
+      "reserveTokens": 4096
+    },
+    "promptBudgeting": {
+      "maxPromptRatio": 0.7,
+      "reserveTokens": 8192
+    }
+  },
   "fragments": {
     "commander": ["custom-instructions.md"]
   }
@@ -133,6 +148,10 @@ Create `~/.config/opencode/micode.json` for micode-specific settings:
 ```
 
 > **Note:** Both `.json` and `.jsonc` formats are supported. JSONC allows comments and trailing commas.
+
+Set `smallContext.contextLimitOverride` when `opencode` does not expose `provider/model.limit.context` for the model you are using. Resolution order is `smallContext.contextLimitOverride`, then `localLLM.contextLimit`, then exact `opencode.json` `provider/model.limit.context`.
+
+Small-context safeguards are not global by default. In `smallContext.mode: "auto"`, micode only enables them for models whose resolved context limit is at or below `smallContext.autoThreshold`. Unknown models stay unresolved, so auto mode stays off unless you force it on, set `smallContext.contextLimitOverride`, set `localLLM.contextLimit`, or define an exact `limit.context` in `opencode.json`.
 
 #### Options
 
@@ -144,6 +163,16 @@ Create `~/.config/opencode/micode.json` for micode-specific settings:
 | `localLLM.contextLimit` | number | Override local LLM context limit. Default: 32768 |
 | `localLLM.toolLoopThreshold` | number | Interrupt after this many identical failing tool calls. Default: 3 |
 | `localLLM.toolLoopMaxInterventions` | number | Max hard interruptions per repeated failure signature before falling back to a blocker. Default: 1 |
+| `smallContext.mode` | string | `"auto"` enables safeguards only for small-context models, `"on"` forces them, `"off"` disables them. Default: `"auto"` |
+| `smallContext.autoThreshold` | number | Context window threshold used by `"auto"` mode. Default: 128000 |
+| `smallContext.contextLimitOverride` | number | Explicit context window to use when `opencode` does not expose `limit.context`. Highest precedence. |
+| `smallContext.continuityAnchor.enabled` | boolean | Enable the continuity anchor helper when small-context safeguards are active. Default: true |
+| `smallContext.continuityAnchor.budgetTokens` | number | Budget reserved for the continuity anchor. Default: 1200 |
+| `smallContext.outputGovernor.enabled` | boolean | Enable output headroom controls when small-context safeguards are active. Default: true |
+| `smallContext.outputGovernor.reserveTokens` | number | Tokens reserved for model output. Default: 4096 |
+| `smallContext.promptBudgeting.enabled` | boolean | Enable prompt budgeting when small-context safeguards are active. Default: true |
+| `smallContext.promptBudgeting.maxPromptRatio` | number | Max share of total context prompt construction may consume. Default: 0.7 |
+| `smallContext.promptBudgeting.reserveTokens` | number | Tokens prompt construction must leave unallocated. Default: 8192 |
 | `fragments` | object | Additional prompt fragments per agent |
 
 #### Model Resolution Priority

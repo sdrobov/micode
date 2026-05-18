@@ -5,10 +5,15 @@ export { ConstraintViolationError, createConstraintReviewerHook } from "./constr
 export {
   type CanReadOptions,
   type CanReadResult,
+  CONTEXT_BUDGET_INVESTIGATION_TYPES,
   type ContextBudgetConfig,
   type ContextBudgetHooks,
   createContextBudgetHook,
+  type FanoutAssessment,
+  type FanoutDecision,
+  type FanoutOptions,
   type FileCostEstimate,
+  type InvestigationType,
   type ReadCostEstimate,
 } from "./context-budget";
 export { createContextInjectorHook } from "./context-injector";
@@ -47,6 +52,18 @@ export {
   type LedgerInfo,
 } from "./ledger-loader";
 export { createMindmodelInjectorHook } from "./mindmodel-injector";
+export { createOutputGovernorHook, type OutputGovernorHooks } from "./output-governor";
+export {
+  createPromptBudgetController,
+  estimatePromptTokens,
+  type PromptBudgetController,
+  type PromptBudgetControllerConfig,
+  type PromptBudgetEntry,
+  type PromptBudgetRequest,
+  type PromptBudgetSelection,
+  selectPromptBudgetEntries,
+  truncatePromptText,
+} from "./prompt-budgeting";
 export {
   createReadGuardHook,
   type ReadGuardHooks,

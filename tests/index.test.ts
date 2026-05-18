@@ -40,9 +40,10 @@ describe("index.ts tool-loop-guard integration", () => {
     expect(source).toContain("createToolLoopGuardHook");
   });
 
-  it("should create the tool loop guard in local LLM hooks", async () => {
+  it("should create the tool loop guard inside runtime hook creation", async () => {
     const source = await readFile("src/index.ts", "utf-8");
-    expect(source).toContain("toolLoopGuardHook: createToolLoopGuardHook(ctx");
+    expect(source).toContain("toolLoopGuardHook: isLocalLLM");
+    expect(source).toContain("createToolLoopGuardHook(ctx");
   });
 
   it("should call tool loop guard in tool.execute.after", async () => {
@@ -53,6 +54,34 @@ describe("index.ts tool-loop-guard integration", () => {
   it("should clean up tool loop guard state on session deletion", async () => {
     const source = await readFile("src/index.ts", "utf-8");
     expect(source).toContain("toolLoopGuardHook?.cleanupSession(sessionId)");
+  });
+});
+
+describe("index.ts small-context integration", () => {
+  it("should create a prompt budget controller from smallContext config", async () => {
+    const source = await readFile("src/index.ts", "utf-8");
+    expect(source).toContain("createPromptBudgetController");
+    expect(source).toContain("const promptBudgetController = smallContext");
+  });
+
+  it("should create and call the output governor hook", async () => {
+    const source = await readFile("src/index.ts", "utf-8");
+    expect(source).toContain("createOutputGovernorHook");
+    expect(source).toContain('outputGovernorHook["tool.execute.after"]');
+  });
+
+  it("should forward prompt budgeting into prompt-injecting hooks", async () => {
+    const source = await readFile("src/index.ts", "utf-8");
+    expect(source).toContain("createContextInjectorHook(ctx, {");
+    expect(source).toContain("createFragmentInjectorHook(ctx, userConfig, {");
+    expect(source).toContain("createMindmodelInjectorHook(ctx, { promptBudget:");
+  });
+
+  it("should wire local context resolution into small-context hooks", async () => {
+    const source = await readFile("src/index.ts", "utf-8");
+    expect(source).toContain("const localContextLimit = isLocalLLM");
+    expect(source).toContain("createPromptBudgetController({ smallContext, modelContextLimits, localContextLimit })");
+    expect(source).toContain("createContextWindowMonitorHook(ctx, {");
   });
 });
 

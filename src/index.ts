@@ -18,7 +18,8 @@ import {
   createFragmentInjectorHook,
   createLedgerLoaderHook,
   createMindmodelInjectorHook,
-  createReadGuardHook,
+  createOutputGovernorHook,
+  createPromptBudgetController,
   createSessionRecoveryHook,
   createTokenAwareTruncationHook,
   createToolLoopGuardHook,
@@ -171,10 +172,10 @@ async function runConstraintReview(
   }
 }
 
-interface LocalLLMHooks {
+interface RuntimeHooks {
   contextBudgetHook: ReturnType<typeof createContextBudgetHook> | null;
-  readGuardHook: ReturnType<typeof createReadGuardHook> | null;
   contextPinnerHook: ReturnType<typeof createContextPinnerHook> | null;
+  outputGovernorHook: ReturnType<typeof createOutputGovernorHook> | null;
   toolLoopGuardHook: ReturnType<typeof createToolLoopGuardHook> | null;
 }
 
@@ -183,34 +184,44 @@ function getProviderID(ctx: PluginInput): string | undefined {
   return typeof record.providerID === "string" ? record.providerID : undefined;
 }
 
-function createLocalLLMHooks(
+function createRuntimeHooks(
   isLocalLLM: boolean,
   ctx: PluginInput,
   userConfig: MicodeConfig | null,
   modelContextLimits: Map<string, number>,
-): LocalLLMHooks {
-  if (!isLocalLLM) {
-    return { contextBudgetHook: null, readGuardHook: null, contextPinnerHook: null, toolLoopGuardHook: null };
+  localContextLimit: number | undefined,
+): RuntimeHooks {
+  const smallContext = userConfig?.smallContext ?? null;
+  const smallContextConfigured = smallContext !== null;
+  const shouldTrackBudget = isLocalLLM || smallContextConfigured;
+
+  if (!shouldTrackBudget) {
+    return { contextBudgetHook: null, contextPinnerHook: null, outputGovernorHook: null, toolLoopGuardHook: null };
   }
 
   const contextBudgetHook = createContextBudgetHook(ctx, {
-    defaultContextLimit: userConfig?.localLLM?.contextLimit,
+    localContextLimit,
     charPerToken: userConfig?.localLLM?.charPerToken,
     maxReadRatio: userConfig?.localLLM?.maxReadRatio,
     minRemainingRatio: userConfig?.localLLM?.minRemainingRatio,
     outputBudget: userConfig?.localLLM?.outputBudget,
     reasoningBudget: userConfig?.localLLM?.reasoningBudget,
     modelContextLimits,
+    smallContext,
   });
 
   return {
     contextBudgetHook,
-    readGuardHook: createReadGuardHook(contextBudgetHook),
-    contextPinnerHook: createContextPinnerHook(),
-    toolLoopGuardHook: createToolLoopGuardHook(ctx, {
-      threshold: userConfig?.localLLM?.toolLoopThreshold,
-      maxInterventions: userConfig?.localLLM?.toolLoopMaxInterventions,
-    }),
+    contextPinnerHook: smallContextConfigured
+      ? createContextPinnerHook({ smallContext, modelContextLimits, localContextLimit })
+      : null,
+    outputGovernorHook: smallContextConfigured ? createOutputGovernorHook(contextBudgetHook) : null,
+    toolLoopGuardHook: isLocalLLM
+      ? createToolLoopGuardHook(ctx, {
+          threshold: userConfig?.localLLM?.toolLoopThreshold,
+          maxInterventions: userConfig?.localLLM?.toolLoopMaxInterventions,
+        })
+      : null,
   };
 }
 
@@ -235,37 +246,64 @@ const OpenCodeConfigPlugin: Plugin = async (ctx) => {
 
   // Load model context limits from opencode.json
   const modelContextLimits = loadModelContextLimits();
+  const smallContext = userConfig?.smallContext ?? null;
 
   // Think mode state per session
   const thinkModeState = new Map<string, boolean>();
 
   // Feature-flagged local LLM mode
   const isLocalLLM = isLocalLLMProvider(getProviderID(ctx));
+  const localContextLimit = isLocalLLM
+    ? (userConfig?.localLLM?.contextLimit ?? config.localLLM.defaultContextLimit)
+    : undefined;
+  const promptBudgetController = smallContext
+    ? createPromptBudgetController({ smallContext, modelContextLimits, localContextLimit })
+    : null;
 
   // Hooks
   const autoCompactHook = createAutoCompactHook(ctx, {
     compactionThreshold: userConfig?.compactionThreshold,
     modelContextLimits,
+    localContextLimit,
+    smallContext,
   });
-  const contextInjectorHook = createContextInjectorHook(ctx);
-  const ledgerLoaderHook = createLedgerLoaderHook(ctx);
-  const sessionRecoveryHook = createSessionRecoveryHook(ctx);
+  const contextInjectorHook = createContextInjectorHook(ctx, {
+    promptBudget: promptBudgetController ?? undefined,
+  });
+  const ledgerLoaderHook = createLedgerLoaderHook(ctx, {
+    modelContextLimits,
+    localContextLimit,
+    promptBudget: promptBudgetController ?? undefined,
+    smallContext,
+  });
+  const sessionRecoveryHook = createSessionRecoveryHook(ctx, {
+    modelContextLimits,
+    localContextLimit,
+    smallContext,
+  });
   const tokenAwareTruncationHook = createTokenAwareTruncationHook(ctx);
-  const contextWindowMonitorHook = createContextWindowMonitorHook(ctx, { modelContextLimits });
+  const contextWindowMonitorHook = createContextWindowMonitorHook(ctx, {
+    modelContextLimits,
+    localContextLimit,
+    smallContext,
+  });
   const commentCheckerHook = createCommentCheckerHook(ctx);
   const artifactAutoIndexHook = createArtifactAutoIndexHook(ctx);
   const fileOpsTrackerHook = createFileOpsTrackerHook(ctx);
   const fetchTrackerHook = createFetchTrackerHook(ctx);
 
   // Fragment injector hook - injects user-defined prompt fragments
-  const fragmentInjectorHook = createFragmentInjectorHook(ctx, userConfig);
+  const fragmentInjectorHook = createFragmentInjectorHook(ctx, userConfig, {
+    promptBudget: promptBudgetController ?? undefined,
+  });
 
-  // Local LLM hooks (only active when provider is a local LLM)
-  const { contextBudgetHook, readGuardHook, contextPinnerHook, toolLoopGuardHook } = createLocalLLMHooks(
+  // Runtime hooks for local models and small-context mode
+  const { contextBudgetHook, contextPinnerHook, outputGovernorHook, toolLoopGuardHook } = createRuntimeHooks(
     isLocalLLM,
     ctx,
     userConfig,
     modelContextLimits,
+    localContextLimit,
   );
 
   // Warn about unknown agent names in fragments config
@@ -276,7 +314,9 @@ const OpenCodeConfigPlugin: Plugin = async (ctx) => {
 
   // Mindmodel injector hook - matches tasks to patterns via keywords and injects them
   // Feature-flagged: set features.mindmodelInjection=true in micode.json to enable
-  const mindmodelInjectorHook = userConfig?.features?.mindmodelInjection ? createMindmodelInjectorHook(ctx) : null;
+  const mindmodelInjectorHook = userConfig?.features?.mindmodelInjection
+    ? createMindmodelInjectorHook(ctx, { promptBudget: promptBudgetController ?? undefined })
+    : null;
 
   // Mindmodel lookup tool - agents call this when they need coding patterns
   const mindmodelLookupTool = createMindmodelLookupTool(ctx);
@@ -297,7 +337,7 @@ const OpenCodeConfigPlugin: Plugin = async (ctx) => {
   const ptyTools = ptyManager.available ? createPtyTools(ptyManager) : {};
 
   // Spawn agent tool (for subagents to spawn other subagents)
-  const spawn_agent = createSpawnAgentTool(ctx);
+  const spawn_agent = createSpawnAgentTool(ctx, contextBudgetHook ?? undefined);
 
   // Batch read tool (for parallel file reads)
   const batch_read = createBatchReadTool(ctx);
@@ -358,7 +398,7 @@ const OpenCodeConfigPlugin: Plugin = async (ctx) => {
       milestone_artifact_search,
       spawn_agent,
       batch_read,
-      ...(isLocalLLM && contextBudgetHook ? createCheckContextBudgetTool(contextBudgetHook) : {}),
+      ...(contextBudgetHook ? createCheckContextBudgetTool(contextBudgetHook) : {}),
       ...mindmodelLookupTool,
       ...ptyTools,
       ...octtoTools,
@@ -460,11 +500,6 @@ const OpenCodeConfigPlugin: Plugin = async (ctx) => {
     ) => {
       const fileOpsSection = formatFileOpsSection(input.sessionID);
 
-      // Augment compaction prompt with context-pinner hints
-      if (contextPinnerHook) {
-        await contextPinnerHook["experimental.session.compacting"](input, output);
-      }
-
       output.prompt = `Create a structured summary for continuing this conversation. Use this EXACT format:
 
 # Session Summary
@@ -501,6 +536,10 @@ IMPORTANT:
 - Focus on information needed to continue seamlessly
 - Be specific about what was done, not vague summaries
 - Include any error messages or issues encountered`;
+
+      if (contextPinnerHook) {
+        await contextPinnerHook["experimental.session.compacting"](input, output);
+      }
     },
 
     // Tool output processing
@@ -515,7 +554,14 @@ IMPORTANT:
       await commentCheckerHook["tool.execute.after"]({ tool: input.tool, args: input.args }, output);
 
       // Directory-aware context injection for Read/Edit
-      await contextInjectorHook["tool.execute.after"]({ tool: input.tool, args: input.args }, output);
+      await contextInjectorHook["tool.execute.after"](
+        { tool: input.tool, sessionID: input.sessionID, args: input.args },
+        output,
+      );
+
+      if (outputGovernorHook) {
+        await outputGovernorHook["tool.execute.after"]({ tool: input.tool, sessionID: input.sessionID }, output);
+      }
 
       // Auto-index artifacts when written to thoughts/ directories
       await artifactAutoIndexHook["tool.execute.after"]({ tool: input.tool, args: input.args }, output);
@@ -526,25 +572,23 @@ IMPORTANT:
         output,
       );
 
+      await fragmentInjectorHook["tool.execute.after"]({ tool: input.tool, args: input.args }, output);
+
       // Track fetch operations and cache results
       await fetchTrackerHook["tool.execute.after"](
         { tool: input.tool, sessionID: input.sessionID, args: input.args },
         output,
       );
 
+      if (mindmodelInjectorHook) {
+        await mindmodelInjectorHook["tool.execute.after"]({ tool: input.tool, args: input.args }, output);
+      }
+
       // Constraint review for Edit/Write
       await constraintReviewerHook["tool.execute.after"](
         { tool: input.tool, sessionID: input.sessionID, args: input.args },
         output,
       );
-
-      // Read guard — intercept read tool outputs when budget is tight
-      if (readGuardHook) {
-        await readGuardHook["tool.execute.after"](
-          { tool: input.tool, sessionID: input.sessionID, args: input.args },
-          output,
-        );
-      }
 
       if (toolLoopGuardHook) {
         await toolLoopGuardHook["tool.execute.after"](
@@ -608,6 +652,10 @@ IMPORTANT:
       // Track context budget usage (message.updated events)
       if (contextBudgetHook) {
         await contextBudgetHook.event({ event });
+      }
+
+      if (promptBudgetController) {
+        await promptBudgetController.event({ event });
       }
 
       // Session cleanup and post-compaction detection for context reminders

@@ -3,6 +3,8 @@ import { describe, expect, it } from "bun:test";
 import { createContextWindowMonitorHook } from "../../src/hooks/context-window-monitor";
 
 describe("context-window-monitor", () => {
+  const KNOWN_LIMITS = new Map([["anthropic/claude-sonnet", 200_000]]);
+
   function createMockCtx() {
     return {
       directory: "/test",
@@ -36,7 +38,7 @@ describe("context-window-monitor", () => {
     });
 
     it("should inject warning message when usage exceeds warning threshold", async () => {
-      const hook = createContextWindowMonitorHook(createMockCtx());
+      const hook = createContextWindowMonitorHook(createMockCtx(), { modelContextLimits: KNOWN_LIMITS });
 
       // Simulate a message.updated event that sets usage above warning threshold (0.7)
       // claude-sonnet = 200k limit; 150k = 75% usage
@@ -64,7 +66,7 @@ describe("context-window-monitor", () => {
     });
 
     it("should inject critical message when usage exceeds critical threshold", async () => {
-      const hook = createContextWindowMonitorHook(createMockCtx());
+      const hook = createContextWindowMonitorHook(createMockCtx(), { modelContextLimits: KNOWN_LIMITS });
 
       // 180k / 200k = 90%, above critical threshold (0.85)
       await hook.event({
@@ -90,7 +92,7 @@ describe("context-window-monitor", () => {
     });
 
     it("should not inject when usage is below warning threshold", async () => {
-      const hook = createContextWindowMonitorHook(createMockCtx());
+      const hook = createContextWindowMonitorHook(createMockCtx(), { modelContextLimits: KNOWN_LIMITS });
 
       // 50k / 200k = 25%, well below 0.7
       await hook.event({
@@ -115,7 +117,7 @@ describe("context-window-monitor", () => {
     });
 
     it("should not inject when system prompt is falsy", async () => {
-      const hook = createContextWindowMonitorHook(createMockCtx());
+      const hook = createContextWindowMonitorHook(createMockCtx(), { modelContextLimits: KNOWN_LIMITS });
 
       // Set up high usage
       await hook.event({
@@ -143,7 +145,7 @@ describe("context-window-monitor", () => {
 
   describe("event handler - message.updated", () => {
     it("should track usage ratio per session", async () => {
-      const hook = createContextWindowMonitorHook(createMockCtx());
+      const hook = createContextWindowMonitorHook(createMockCtx(), { modelContextLimits: KNOWN_LIMITS });
 
       // 140k / 200k = 70% - right at warning threshold
       await hook.event({
@@ -217,11 +219,68 @@ describe("context-window-monitor", () => {
 
       expect(output.system).toContain("<context-status>");
     });
+
+    it("should skip warnings for unresolved models without an override", async () => {
+      const hook = createContextWindowMonitorHook(createMockCtx());
+
+      await hook.event({
+        event: {
+          type: "message.updated",
+          properties: {
+            info: {
+              sessionID: "s1",
+              role: "assistant",
+              tokens: { input: 180_000 },
+              modelID: "mystery-model",
+              providerID: "custom",
+            },
+          },
+        },
+      });
+
+      const output = { system: "System prompt.", options: {} };
+      await hook["chat.params"]({ sessionID: "s1" }, output);
+
+      expect(output.system).toBe("System prompt.");
+    });
+
+    it("should use the context override for unresolved models", async () => {
+      const hook = createContextWindowMonitorHook(createMockCtx(), {
+        smallContext: {
+          mode: "auto",
+          autoThreshold: 96_000,
+          contextLimitOverride: 64_000,
+          continuityAnchor: { enabled: true, budgetTokens: 120 },
+          outputGovernor: { enabled: true, reserveTokens: 4_096 },
+          promptBudgeting: { enabled: true, maxPromptRatio: 0.7, reserveTokens: 8_192 },
+        },
+      });
+
+      await hook.event({
+        event: {
+          type: "message.updated",
+          properties: {
+            info: {
+              sessionID: "s1",
+              role: "assistant",
+              tokens: { input: 48_000 },
+              modelID: "mystery-model",
+              providerID: "custom",
+            },
+          },
+        },
+      });
+
+      const output = { system: "System prompt.", options: {} };
+      await hook["chat.params"]({ sessionID: "s1" }, output);
+
+      expect(output.system).toContain("<context-status>");
+    });
   });
 
   describe("event handler - session.deleted", () => {
     it("should clean up session state on deletion", async () => {
-      const hook = createContextWindowMonitorHook(createMockCtx());
+      const hook = createContextWindowMonitorHook(createMockCtx(), { modelContextLimits: KNOWN_LIMITS });
 
       // Set up usage data
       await hook.event({
@@ -269,7 +328,7 @@ describe("context-window-monitor", () => {
 
   describe("session isolation", () => {
     it("should track different sessions independently", async () => {
-      const hook = createContextWindowMonitorHook(createMockCtx());
+      const hook = createContextWindowMonitorHook(createMockCtx(), { modelContextLimits: KNOWN_LIMITS });
 
       // Session 1: high usage
       await hook.event({

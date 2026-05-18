@@ -8,6 +8,11 @@ const MS_PER_SECOND = 1000;
 const SECONDS_PER_MINUTE = 60;
 const ANSWER_TIMEOUT_MINUTES = 5;
 const REVIEW_TIMEOUT_MINUTES = 10;
+const SMALL_CONTEXT_AUTO_THRESHOLD = 128_000;
+const SMALL_CONTEXT_CONTINUITY_ANCHOR_BUDGET = 1_200;
+const SMALL_CONTEXT_OUTPUT_RESERVE = 4_096;
+const SMALL_CONTEXT_PROMPT_MAX_RATIO = 0.7;
+const SMALL_CONTEXT_PROMPT_RESERVE = 8_192;
 
 /**
  * Application configuration constants.
@@ -140,6 +145,36 @@ export const config = {
   model: {
     /** Plugin fallback model when no opencode.json or micode.json model is configured */
     default: "openai/gpt-5.2-codex",
+  },
+
+  /**
+   * Small-context behavior settings
+   */
+  smallContext: {
+    /** Enable small-context safeguards automatically, always, or never */
+    mode: "auto",
+    /** Treat models at or below this context window as small-context */
+    autoThreshold: SMALL_CONTEXT_AUTO_THRESHOLD,
+    continuityAnchor: {
+      /** Keep a compact continuity anchor available for small-context models */
+      enabled: true,
+      /** Budget reserved for the continuity anchor */
+      budgetTokens: SMALL_CONTEXT_CONTINUITY_ANCHOR_BUDGET,
+    },
+    outputGovernor: {
+      /** Reserve output headroom when small-context safeguards are active */
+      enabled: true,
+      /** Budget reserved for model output */
+      reserveTokens: SMALL_CONTEXT_OUTPUT_RESERVE,
+    },
+    promptBudgeting: {
+      /** Apply prompt budgeting when small-context safeguards are active */
+      enabled: true,
+      /** Max share of total context that prompt construction may consume */
+      maxPromptRatio: SMALL_CONTEXT_PROMPT_MAX_RATIO,
+      /** Tokens that prompt construction must leave unallocated */
+      reserveTokens: SMALL_CONTEXT_PROMPT_RESERVE,
+    },
   },
 
   /**

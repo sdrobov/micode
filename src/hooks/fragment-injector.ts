@@ -1,11 +1,17 @@
 // src/hooks/fragment-injector.ts
 import { readFile } from "node:fs/promises";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 
 import type { PluginInput } from "@opencode-ai/plugin";
 import * as v from "valibot";
 
 import type { MicodeConfig } from "@/config-loader";
+import type { PromptBudgetController, PromptBudgetEntry } from "./prompt-budgeting";
+import { estimatePromptTokens, selectPromptBudgetEntries, truncatePromptText } from "./prompt-budgeting";
+
+const FRAGMENTS_PATH = ".micode/fragments.json";
+const FRAGMENT_OMISSION_NOTE = "Additional instructions omitted for small-context prompt budget.";
+const FRAGMENT_TRUNCATION_SUFFIX = " (truncated for small-context prompt budget)";
 
 /**
  * Schema for a project fragments file: Record<string, string[]>
@@ -171,12 +177,64 @@ export function warnUnknownAgents(fragmentAgents: string[], knownAgents: Set<str
  */
 interface FragmentInjectorHooks {
   "chat.params": (
-    _input: { sessionID: string },
+    input: { sessionID: string },
     output: { options?: Record<string, unknown>; system?: string },
+  ) => Promise<void>;
+  "tool.execute.after": (
+    input: { tool: string; args?: Record<string, unknown> },
+    output: { output?: string },
   ) => Promise<void>;
 }
 
-export function createFragmentInjectorHook(ctx: PluginInput, globalConfig: MicodeConfig | null): FragmentInjectorHooks {
+export interface FragmentInjectorConfig {
+  readonly promptBudget?: PromptBudgetController;
+}
+
+function createChatParamsHandler(
+  globalConfig: MicodeConfig | null,
+  getProjectFragments: () => Promise<Record<string, string[]>>,
+  promptBudget?: PromptBudgetController,
+): FragmentInjectorHooks["chat.params"] {
+  return async (input, output) => {
+    const agent = output.options?.agent as string | undefined;
+    if (!agent) return;
+
+    const globalFragments = globalConfig?.fragments ?? {};
+    const projectFragments = await getProjectFragments();
+    const mergedFragments = mergeFragments(globalFragments, projectFragments);
+    const agentFragments = mergedFragments[agent];
+    if (!agentFragments || agentFragments.length === 0) return;
+
+    const fragmentBlock = formatBudgetedFragments(agentFragments, {
+      existingText: output.system,
+      options: output.options,
+      promptBudget,
+      sessionID: input.sessionID,
+    });
+    if (!fragmentBlock) return;
+    output.system = output.system ? fragmentBlock + output.system : fragmentBlock;
+  };
+}
+
+function createToolExecuteHandler(
+  projectDir: string,
+  clearProjectFragments: () => void,
+): FragmentInjectorHooks["tool.execute.after"] {
+  return async (input) => {
+    if (!["Edit", "edit", "Write", "write"].includes(input.tool)) return;
+
+    const filePath = getToolFilePath(input.args);
+    if (!filePath) return;
+    if (resolve(filePath) !== resolve(projectDir, FRAGMENTS_PATH)) return;
+    clearProjectFragments();
+  };
+}
+
+export function createFragmentInjectorHook(
+  ctx: PluginInput,
+  globalConfig: MicodeConfig | null,
+  hookConfig?: FragmentInjectorConfig,
+): FragmentInjectorHooks {
   // Cache for project fragments (loaded once per session)
   let projectFragmentsCache: Record<string, string[]> | null = null;
 
@@ -187,28 +245,61 @@ export function createFragmentInjectorHook(ctx: PluginInput, globalConfig: Micod
     return projectFragmentsCache;
   }
 
+  function clearProjectFragments(): void {
+    projectFragmentsCache = null;
+  }
+
   return {
-    "chat.params": async (
-      _input: { sessionID: string },
-      output: { options?: Record<string, unknown>; system?: string },
-    ) => {
-      const agent = output.options?.agent as string | undefined;
-      if (!agent) return;
-
-      const globalFragments = globalConfig?.fragments ?? {};
-      const projectFragments = await getProjectFragments();
-      const mergedFragments = mergeFragments(globalFragments, projectFragments);
-
-      const agentFragments = mergedFragments[agent];
-      if (!agentFragments || agentFragments.length === 0) return;
-
-      const fragmentBlock = formatFragmentsBlock(agentFragments);
-
-      if (output.system) {
-        output.system = fragmentBlock + output.system;
-      } else {
-        output.system = fragmentBlock;
-      }
-    },
+    "chat.params": createChatParamsHandler(globalConfig, getProjectFragments, hookConfig?.promptBudget),
+    "tool.execute.after": createToolExecuteHandler(ctx.directory, clearProjectFragments),
   };
+}
+
+function getToolFilePath(args?: Record<string, unknown>): string | undefined {
+  const filePath = args?.filePath;
+  if (typeof filePath === "string") return filePath;
+  const snakeCaseFilePath = args?.file_path;
+  return typeof snakeCaseFilePath === "string" ? snakeCaseFilePath : undefined;
+}
+
+function formatBudgetedFragments(
+  fragments: string[],
+  options: {
+    readonly existingText?: string;
+    readonly options?: Record<string, unknown>;
+    readonly promptBudget?: PromptBudgetController;
+    readonly sessionID: string;
+  },
+): string {
+  const remainingTokens = options.promptBudget?.getRemainingTokens({
+    existingText: options.existingText,
+    options: options.options,
+    sessionID: options.sessionID,
+  });
+  if (remainingTokens == null) return formatFragmentsBlock(fragments);
+
+  const entries: PromptBudgetEntry<string>[] = fragments.map((fragment, index) => ({
+    value: fragment,
+    text: `- ${fragment}`,
+    priority: index,
+    dedupeKey: fragment,
+  }));
+  const selection = selectPromptBudgetEntries(entries, remainingTokens, truncateFragmentEntry);
+  if (selection.values.length === 0) return "";
+
+  const formatted = selection.omittedCount > 0 ? [...selection.values, FRAGMENT_OMISSION_NOTE] : selection.values;
+  return formatFragmentsBlock([...formatted]);
+}
+
+function truncateFragmentEntry(
+  entry: PromptBudgetEntry<string>,
+  remainingTokens: number,
+): PromptBudgetEntry<string> | null {
+  const content = truncatePromptText(
+    entry.value,
+    remainingTokens - estimatePromptTokens("- "),
+    FRAGMENT_TRUNCATION_SUFFIX,
+  );
+  if (!content) return null;
+  return { ...entry, value: content, text: `- ${content}` };
 }

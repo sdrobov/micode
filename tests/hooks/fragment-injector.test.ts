@@ -270,6 +270,76 @@ describe("fragment-injector", () => {
       // Should not crash, system unchanged
       expect(output.system).toBe("Original prompt");
     });
+
+    it("should dedupe and budget fragments in small-context mode", async () => {
+      const { createFragmentInjectorHook } = await import("../../src/hooks/fragment-injector");
+      const { createPromptBudgetController } = await import("../../src/hooks/prompt-budgeting");
+      const { parseSmallContextConfig } = await import("../../src/config-schemas");
+      const ctx = createMockCtx(testDir);
+
+      const smallContext = parseSmallContextConfig({
+        mode: "on",
+        autoThreshold: 320,
+        promptBudgeting: {
+          maxPromptRatio: 0.3,
+          reserveTokens: 20,
+        },
+      });
+      const hooks = createFragmentInjectorHook(
+        ctx as any,
+        {
+          fragments: {
+            brainstormer: [
+              "Shared instruction",
+              "Shared instruction",
+              "A very long instruction ".repeat(20),
+              "Tail instruction",
+            ],
+          },
+        },
+        { promptBudget: createPromptBudgetController({ smallContext }) },
+      );
+
+      const output = {
+        system: `Original prompt ${"X".repeat(160)}`,
+        options: { agent: "brainstormer" },
+      };
+
+      await hooks["chat.params"]({ sessionID: "budget-session" }, output);
+
+      expect(output.system.match(/Shared instruction/g)?.length).toBe(1);
+      expect(output.system).toContain("Additional instructions omitted for small-context prompt budget.");
+      expect(output.system).toContain("truncated for small-context prompt budget");
+    });
+
+    it("should invalidate cached project fragments after writes", async () => {
+      const micodeDir = join(testDir, ".micode");
+      mkdirSync(micodeDir, { recursive: true });
+      const fragmentsPath = join(micodeDir, "fragments.json");
+      writeFileSync(fragmentsPath, JSON.stringify({ brainstormer: ["Before write"] }));
+
+      const { createFragmentInjectorHook } = await import("../../src/hooks/fragment-injector");
+      const ctx = createMockCtx(testDir);
+      const hooks = createFragmentInjectorHook(ctx as any, null);
+
+      const before = {
+        system: "Original prompt",
+        options: { agent: "brainstormer" },
+      };
+      await hooks["chat.params"]({ sessionID: "cache-session" }, before);
+      expect(before.system).toContain("Before write");
+
+      writeFileSync(fragmentsPath, JSON.stringify({ brainstormer: ["After write"] }));
+      await hooks["tool.execute.after"]({ tool: "Write", args: { filePath: fragmentsPath } }, { output: "" });
+
+      const after = {
+        system: "Original prompt",
+        options: { agent: "brainstormer" },
+      };
+      await hooks["chat.params"]({ sessionID: "cache-session" }, after);
+      expect(after.system).toContain("After write");
+      expect(after.system).not.toContain("Before write");
+    });
   });
 
   describe("warnUnknownAgents", () => {

@@ -2,6 +2,8 @@
 // Valibot schemas for micode.json and opencode.json config validation
 import * as v from "valibot";
 
+import { config } from "@/utils/config";
+
 // --- micode.json schemas ---
 
 const ThinkingSchema = v.object({
@@ -21,6 +23,46 @@ const MicodeFeaturesSchema = v.object({
   localLLM: v.optional(v.boolean()),
 });
 
+const SmallContextModes = ["off", "auto", "on"] as const;
+const RatioSchema = v.pipe(v.number(), v.minValue(0), v.maxValue(1));
+
+const SmallContextContinuityAnchorSchema = v.object({
+  enabled: v.optional(v.boolean(), config.smallContext.continuityAnchor.enabled),
+  budgetTokens: v.optional(v.pipe(v.number(), v.minValue(1)), config.smallContext.continuityAnchor.budgetTokens),
+});
+
+const SmallContextOutputGovernorSchema = v.object({
+  enabled: v.optional(v.boolean(), config.smallContext.outputGovernor.enabled),
+  reserveTokens: v.optional(v.pipe(v.number(), v.minValue(1)), config.smallContext.outputGovernor.reserveTokens),
+});
+
+const SmallContextPromptBudgetingSchema = v.object({
+  enabled: v.optional(v.boolean(), config.smallContext.promptBudgeting.enabled),
+  maxPromptRatio: v.optional(RatioSchema, config.smallContext.promptBudgeting.maxPromptRatio),
+  reserveTokens: v.optional(v.pipe(v.number(), v.minValue(1)), config.smallContext.promptBudgeting.reserveTokens),
+});
+
+export const SmallContextConfigSchema = v.object({
+  mode: v.optional(v.picklist(SmallContextModes), config.smallContext.mode),
+  autoThreshold: v.optional(v.pipe(v.number(), v.minValue(1)), config.smallContext.autoThreshold),
+  contextLimitOverride: v.optional(v.pipe(v.number(), v.minValue(1))),
+  continuityAnchor: v.optional(SmallContextContinuityAnchorSchema, {
+    enabled: config.smallContext.continuityAnchor.enabled,
+    budgetTokens: config.smallContext.continuityAnchor.budgetTokens,
+  }),
+  outputGovernor: v.optional(SmallContextOutputGovernorSchema, {
+    enabled: config.smallContext.outputGovernor.enabled,
+    reserveTokens: config.smallContext.outputGovernor.reserveTokens,
+  }),
+  promptBudgeting: v.optional(SmallContextPromptBudgetingSchema, {
+    enabled: config.smallContext.promptBudgeting.enabled,
+    maxPromptRatio: config.smallContext.promptBudgeting.maxPromptRatio,
+    reserveTokens: config.smallContext.promptBudgeting.reserveTokens,
+  }),
+});
+
+export type SmallContextConfig = v.InferOutput<typeof SmallContextConfigSchema>;
+
 /**
  * Schema for the raw micode.json config file.
  * All fields are optional — users can provide any subset.
@@ -37,6 +79,7 @@ export const RawMicodeConfigSchema = v.object({
   compactionThreshold: v.optional(v.unknown()),
   fragments: v.optional(v.record(v.string(), v.unknown())),
   localLLM: v.optional(v.unknown()),
+  smallContext: v.optional(v.unknown()),
 });
 
 // Safe properties that users can override in agent configs
@@ -116,6 +159,16 @@ export function sanitizeFragments(raw: Record<string, unknown>): Record<string, 
     }
   }
   return sanitized;
+}
+
+/**
+ * Parse and validate a raw smallContext config object.
+ * Returns null on invalid input.
+ */
+export function parseSmallContextConfig(raw: unknown): SmallContextConfig | null {
+  const result = v.safeParse(SmallContextConfigSchema, raw);
+  if (!result.success) return null;
+  return result.output;
 }
 
 // --- opencode.json schemas ---

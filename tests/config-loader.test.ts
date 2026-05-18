@@ -365,6 +365,70 @@ describe("loadMicodeConfig - compactionThreshold", () => {
   });
 });
 
+describe("loadMicodeConfig - smallContext", () => {
+  let testConfigDir: string;
+
+  beforeEach(() => {
+    testConfigDir = join(tmpdir(), `micode-config-test-${Date.now()}`);
+    mkdirSync(testConfigDir, { recursive: true });
+  });
+
+  afterEach(() => {
+    rmSync(testConfigDir, { recursive: true, force: true });
+  });
+
+  it("should load smallContext config from micode.json", async () => {
+    const configPath = join(testConfigDir, "micode.json");
+    writeFileSync(
+      configPath,
+      JSON.stringify({
+        smallContext: {
+          mode: "auto",
+          autoThreshold: 96_000,
+          contextLimitOverride: 48_000,
+          continuityAnchor: {
+            budgetTokens: 900,
+          },
+          outputGovernor: {
+            reserveTokens: 2_048,
+          },
+          promptBudgeting: {
+            maxPromptRatio: 0.55,
+          },
+        },
+      }),
+    );
+
+    const config = await loadMicodeConfig(testConfigDir);
+
+    expect(config).not.toBeNull();
+    expect(config?.smallContext?.mode).toBe("auto");
+    expect(config?.smallContext?.autoThreshold).toBe(96_000);
+    expect(config?.smallContext?.contextLimitOverride).toBe(48_000);
+    expect(config?.smallContext?.continuityAnchor.budgetTokens).toBe(900);
+    expect(config?.smallContext?.outputGovernor.reserveTokens).toBe(2_048);
+    expect(config?.smallContext?.promptBudgeting.maxPromptRatio).toBe(0.55);
+    expect(config?.smallContext?.promptBudgeting.reserveTokens).toBe(8_192);
+  });
+
+  it("should set invalid smallContext config to null", async () => {
+    const configPath = join(testConfigDir, "micode.json");
+    writeFileSync(
+      configPath,
+      JSON.stringify({
+        smallContext: {
+          mode: "maybe",
+        },
+      }),
+    );
+
+    const config = await loadMicodeConfig(testConfigDir);
+
+    expect(config).not.toBeNull();
+    expect(config?.smallContext).toBeNull();
+  });
+});
+
 describe("loadModelContextLimits", () => {
   let testConfigDir: string;
 

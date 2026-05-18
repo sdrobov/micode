@@ -1,16 +1,29 @@
 // src/hooks/mindmodel-injector.ts
 import { readFile } from "node:fs/promises";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 
 import type { PluginInput } from "@opencode-ai/plugin";
 
-import { formatExamplesForInjection, type LoadedMindmodel, loadExamples, loadMindmodel } from "@/mindmodel";
+import {
+  formatExamplesForInjection,
+  type LoadedExample,
+  type LoadedMindmodel,
+  loadExamples,
+  loadMindmodel,
+} from "@/mindmodel";
 import { matchCategories } from "@/tools/mindmodel-lookup";
 import { config } from "@/utils/config";
+import type { PromptBudgetController, PromptBudgetEntry } from "./prompt-budgeting";
+import { estimatePromptTokens, selectPromptBudgetEntries, truncatePromptText } from "./prompt-budgeting";
 
 const HASH_BIT_SHIFT = 5;
 const BASE_36_RADIX = 36;
 const TASK_CACHE_MAX_ENTRIES = 2000;
+const MINDMODEL_TRUNCATION_SUFFIX = "\n\n[Example trimmed for small-context prompt budget]";
+const CONSTRAINT_TRUNCATION_SUFFIX = "\n\n[Constraints trimmed for small-context prompt budget]";
+const EXAMPLES_INTRO =
+  "These are code examples from this project's mindmodel. Follow these patterns when implementing similar functionality.";
+const EXAMPLES_OMISSION_NOTE = "Additional examples omitted for small-context prompt budget.";
 
 interface MessagePart {
   type: string;
@@ -37,7 +50,7 @@ function hashTask(task: string): string {
 interface LRUCache<V> {
   get(key: string): V | undefined;
   set(key: string, value: V): void;
-  has(key: string): boolean;
+  clear(): void;
 }
 
 function createLRUCache<V>(maxSize: number): LRUCache<V> {
@@ -65,8 +78,8 @@ function createLRUCache<V>(maxSize: number): LRUCache<V> {
       cache.set(key, value);
     },
 
-    has(key: string): boolean {
-      return cache.has(key);
+    clear(): void {
+      cache.clear();
     },
   };
 }
@@ -86,29 +99,23 @@ function extractTaskFromMessages(messages: MessageWithParts[]): string {
 async function resolveInjection(
   task: string,
   mindmodel: LoadedMindmodel,
-  matchedTasks: LRUCache<string>,
-): Promise<string | null> {
+  matchedTasks: LRUCache<LoadedExample[]>,
+): Promise<LoadedExample[]> {
   const taskHash = hashTask(task);
-  const injection = matchedTasks.get(taskHash);
-  if (injection !== undefined) {
-    return injection || null;
+  const cachedExamples = matchedTasks.get(taskHash);
+  if (cachedExamples !== undefined) {
+    return cachedExamples;
   }
 
   const categories = matchCategories(task, mindmodel.manifest);
   if (categories.length === 0) {
-    matchedTasks.set(taskHash, "");
-    return null;
+    matchedTasks.set(taskHash, []);
+    return [];
   }
 
   const examples = await loadExamples(mindmodel, categories);
-  if (examples.length === 0) {
-    matchedTasks.set(taskHash, "");
-    return null;
-  }
-
-  const formatted = formatExamplesForInjection(examples);
-  matchedTasks.set(taskHash, formatted);
-  return formatted;
+  matchedTasks.set(taskHash, examples);
+  return examples;
 }
 
 async function loadSystemMd(directory: string): Promise<string | null> {
@@ -120,54 +127,285 @@ async function loadSystemMd(directory: string): Promise<string | null> {
   }
 }
 
-function createCachedLoader<T>(loader: () => Promise<T | null>): () => Promise<T | null> {
+interface ResettableCachedLoader<T> {
+  load: () => Promise<T | null>;
+  clear: () => void;
+}
+
+function createCachedLoader<T>(loader: () => Promise<T | null>): ResettableCachedLoader<T> {
   let cached: T | null | undefined;
-  return async () => {
-    if (cached === undefined) cached = await loader();
-    return cached;
+
+  return {
+    load: async () => {
+      if (cached === undefined) cached = await loader();
+      return cached;
+    },
+    clear: () => {
+      cached = undefined;
+    },
   };
 }
 
 interface MindmodelInjectorHooks {
   "experimental.chat.messages.transform": (
-    _input: Record<string, unknown>,
+    _input: { sessionID?: string } & Record<string, unknown>,
     output: { messages: MessageWithParts[] },
   ) => Promise<void>;
   "experimental.chat.system.transform": (_input: { sessionID: string }, output: { system: string[] }) => Promise<void>;
+  "tool.execute.after": (
+    input: { tool: string; args?: Record<string, unknown> },
+    output: { output?: string },
+  ) => Promise<void>;
 }
 
-export function createMindmodelInjectorHook(ctx: PluginInput): MindmodelInjectorHooks {
-  let pendingInjection: string | null = null;
-  const matchedTasks = createLRUCache<string>(TASK_CACHE_MAX_ENTRIES);
+export interface MindmodelInjectorConfig {
+  readonly promptBudget?: PromptBudgetController;
+}
+
+interface ExampleBlock {
+  readonly path: string;
+  readonly description: string;
+  readonly content: string;
+}
+
+function createMessageTransformHandler(
+  getMindmodel: ResettableCachedLoader<LoadedMindmodel>,
+  matchedTasks: LRUCache<LoadedExample[]>,
+  pendingInjections: Map<string, LoadedExample[]>,
+): MindmodelInjectorHooks["experimental.chat.messages.transform"] {
+  return async (input, output) => {
+    try {
+      const sessionID = input.sessionID;
+      if (!sessionID) return;
+
+      const mindmodel = await getMindmodel.load();
+      if (!mindmodel) {
+        pendingInjections.delete(sessionID);
+        return;
+      }
+
+      const task = extractTaskFromMessages(output.messages);
+      if (!task) {
+        pendingInjections.delete(sessionID);
+        return;
+      }
+
+      const examples = await resolveInjection(task, mindmodel, matchedTasks);
+      if (examples.length === 0) {
+        pendingInjections.delete(sessionID);
+        return;
+      }
+      pendingInjections.set(sessionID, examples);
+    } catch {
+      // Silently ignore errors so pattern lookup never blocks the main flow.
+    }
+  };
+}
+
+function createSystemTransformHandler(
+  getSystemMd: ResettableCachedLoader<string>,
+  pendingInjections: Map<string, LoadedExample[]>,
+  promptBudget?: PromptBudgetController,
+): MindmodelInjectorHooks["experimental.chat.system.transform"] {
+  return async (input, output) => {
+    const systemMd = await getSystemMd.load();
+    const examples = pendingInjections.get(input.sessionID) ?? [];
+    pendingInjections.delete(input.sessionID);
+
+    const remainingTokens = promptBudget?.getRemainingTokens({
+      existingText: output.system,
+      sessionID: input.sessionID,
+    });
+    if (remainingTokens == null) {
+      injectMindmodelContent(output, systemMd, examples);
+      return;
+    }
+
+    injectBudgetedMindmodelContent(output, systemMd, examples, remainingTokens);
+  };
+}
+
+function createToolExecuteHandler(
+  projectDir: string,
+  matchedTasks: LRUCache<LoadedExample[]>,
+  pendingInjections: Map<string, LoadedExample[]>,
+  getMindmodel: ResettableCachedLoader<LoadedMindmodel>,
+  getSystemMd: ResettableCachedLoader<string>,
+): MindmodelInjectorHooks["tool.execute.after"] {
+  return async (input) => {
+    if (!["Edit", "edit", "Write", "write"].includes(input.tool)) return;
+
+    const filePath = getToolFilePath(input.args);
+    if (!filePath) return;
+    if (!resolve(filePath).startsWith(resolve(projectDir, config.paths.mindmodelDir))) return;
+    matchedTasks.clear();
+    pendingInjections.clear();
+    getMindmodel.clear();
+    getSystemMd.clear();
+  };
+}
+
+export function createMindmodelInjectorHook(
+  ctx: PluginInput,
+  hookConfig?: MindmodelInjectorConfig,
+): MindmodelInjectorHooks {
+  const pendingInjections = new Map<string, LoadedExample[]>();
+  const matchedTasks = createLRUCache<LoadedExample[]>(TASK_CACHE_MAX_ENTRIES);
   const getMindmodel = createCachedLoader(() => loadMindmodel(ctx.directory));
   const getSystemMd = createCachedLoader(() => loadSystemMd(ctx.directory));
 
   return {
-    "experimental.chat.messages.transform": async (
-      _input: Record<string, unknown>,
-      output: { messages: MessageWithParts[] },
-    ) => {
-      try {
-        const mindmodel = await getMindmodel();
-        if (!mindmodel) return;
-        const task = extractTaskFromMessages(output.messages);
-        if (!task) return;
-        pendingInjection = await resolveInjection(task, mindmodel, matchedTasks);
-      } catch {
-        // Silently ignore errors - don't break the main flow
-      }
-    },
-
-    "experimental.chat.system.transform": async (_input: { sessionID: string }, output: { system: string[] }) => {
-      const systemMd = await getSystemMd();
-      if (systemMd) {
-        output.system.unshift(`<mindmodel-constraints>\n${systemMd}\n</mindmodel-constraints>`);
-      }
-      if (pendingInjection) {
-        const injection = pendingInjection;
-        pendingInjection = null;
-        output.system.unshift(injection);
-      }
-    },
+    "experimental.chat.messages.transform": createMessageTransformHandler(
+      getMindmodel,
+      matchedTasks,
+      pendingInjections,
+    ),
+    "experimental.chat.system.transform": createSystemTransformHandler(
+      getSystemMd,
+      pendingInjections,
+      hookConfig?.promptBudget,
+    ),
+    "tool.execute.after": createToolExecuteHandler(
+      ctx.directory,
+      matchedTasks,
+      pendingInjections,
+      getMindmodel,
+      getSystemMd,
+    ),
   };
+}
+
+function getToolFilePath(args?: Record<string, unknown>): string | undefined {
+  const filePath = args?.filePath;
+  if (typeof filePath === "string") return filePath;
+  const snakeCaseFilePath = args?.file_path;
+  return typeof snakeCaseFilePath === "string" ? snakeCaseFilePath : undefined;
+}
+
+function formatConstraintBlock(content: string): string {
+  return `<mindmodel-constraints>\n${content}\n</mindmodel-constraints>`;
+}
+
+function toExampleBlock(example: LoadedExample): ExampleBlock {
+  return {
+    path: example.path,
+    description: example.description,
+    content: example.content,
+  };
+}
+
+function formatSingleExample(example: ExampleBlock): string {
+  return `<example category="${example.path}" description="${example.description}">
+${example.content}
+</example>`;
+}
+
+function formatExampleBlocks(examples: readonly ExampleBlock[], omittedCount = 0): string {
+  if (examples.length === 0 && omittedCount === 0) return "";
+
+  const blocks = examples.map((example) => formatSingleExample(example));
+  if (omittedCount > 0) {
+    blocks.push(EXAMPLES_OMISSION_NOTE);
+  }
+
+  return `<mindmodel-examples>
+${EXAMPLES_INTRO}
+
+${blocks.join("\n\n")}
+</mindmodel-examples>`;
+}
+
+function formatExampleWrapper(content: string): string {
+  return `<mindmodel-examples>
+${EXAMPLES_INTRO}
+
+${content}
+</mindmodel-examples>`;
+}
+
+function truncateConstraintBlock(content: string, remainingTokens: number): string | null {
+  const wrapperTokens = estimatePromptTokens(formatConstraintBlock(""));
+  return truncatePromptText(content, remainingTokens - wrapperTokens, CONSTRAINT_TRUNCATION_SUFFIX);
+}
+
+function truncateExampleEntry(
+  entry: PromptBudgetEntry<ExampleBlock>,
+  remainingTokens: number,
+): PromptBudgetEntry<ExampleBlock> | null {
+  const wrapperTokens = estimatePromptTokens(formatSingleExample({ ...entry.value, content: "" }));
+  const content = truncatePromptText(entry.value.content, remainingTokens - wrapperTokens, MINDMODEL_TRUNCATION_SUFFIX);
+  if (!content) return null;
+
+  const value = { ...entry.value, content };
+  return { ...entry, value, text: formatSingleExample(value) };
+}
+
+function toExampleEntries(examples: readonly LoadedExample[]): PromptBudgetEntry<ExampleBlock>[] {
+  return examples.map((example, index) => {
+    const value = toExampleBlock(example);
+    return {
+      value,
+      text: formatSingleExample(value),
+      priority: index,
+      dedupeKey: example.path,
+    };
+  });
+}
+
+function injectMindmodelContent(
+  output: { system: string[] },
+  systemMd: string | null,
+  examples: readonly LoadedExample[],
+): void {
+  if (systemMd) {
+    output.system.unshift(formatConstraintBlock(systemMd));
+  }
+  if (examples.length > 0) {
+    output.system.unshift(formatExamplesForInjection([...examples]));
+  }
+}
+
+function injectBudgetedMindmodelContent(
+  output: { system: string[] },
+  systemMd: string | null,
+  examples: readonly LoadedExample[],
+  remainingTokens: number,
+): void {
+  let budget = remainingTokens;
+
+  if (systemMd) {
+    const block = fitConstraintBlock(systemMd, budget);
+    if (block) {
+      output.system.unshift(block);
+      budget -= estimatePromptTokens(block);
+    }
+  }
+
+  if (budget <= 0 || examples.length === 0) return;
+  const examplesBlock = fitExampleBlocks(examples, budget);
+  if (examplesBlock) {
+    output.system.unshift(examplesBlock);
+  }
+}
+
+function fitConstraintBlock(content: string, remainingTokens: number): string | null {
+  const block = formatConstraintBlock(content);
+  const fullTokens = estimatePromptTokens(block);
+  if (fullTokens <= remainingTokens) return block;
+
+  const truncated = truncateConstraintBlock(content, remainingTokens);
+  return truncated ? formatConstraintBlock(truncated) : null;
+}
+
+function fitExampleBlocks(examples: readonly LoadedExample[], remainingTokens: number): string | null {
+  const wrapperTokens = estimatePromptTokens(formatExampleWrapper(""));
+  if (remainingTokens <= wrapperTokens) return null;
+
+  const selection = selectPromptBudgetEntries(
+    toExampleEntries(examples),
+    remainingTokens - wrapperTokens,
+    truncateExampleEntry,
+  );
+  if (selection.values.length === 0) return null;
+  return formatExampleBlocks(selection.values, selection.omittedCount);
 }

@@ -1,5 +1,7 @@
 import type { PluginInput, ToolDefinition } from "@opencode-ai/plugin";
 import { type ToolContext, tool } from "@opencode-ai/plugin/tool";
+import type { ContextBudgetHooks, OutputGovernorState } from "@/hooks/context-budget";
+import { governToolOutput } from "@/hooks/output-governor";
 import { extractErrorMessage } from "@/utils/errors";
 
 // Extended context with metadata (available but not typed in plugin API)
@@ -9,6 +11,10 @@ type ExtendedContext = ToolContext & {
 };
 
 const MS_PER_SECOND = 1000;
+const MAX_PLAIN_SUMMARY_LINES = 2;
+const CODE_FENCE = /^```/;
+const SUMMARY_LINE_PATTERNS = [/^#{1,6}\s/, /^[-*]\s/, /^\d+\.\s/, /^\*\*.+\*\*/, /^\|/, /^`[^`]+`/] as const;
+const SUMMARY_OMISSION_NOTE = "[Detailed code excerpts omitted to keep the subagent summary compact.]";
 
 interface SessionCreateResponse {
   readonly data?: { readonly id?: string };
@@ -32,6 +38,82 @@ interface AgentTask {
   readonly agent: string;
   readonly prompt: string;
   readonly description: string;
+}
+
+function getSessionId(toolCtx: ToolContext): string {
+  const record = toolCtx as Record<string, unknown>;
+  return (record.sessionID as string | undefined) ?? (record.session_id as string | undefined) ?? "unknown";
+}
+
+function isSummaryLine(line: string): boolean {
+  return SUMMARY_LINE_PATTERNS.some((pattern) => pattern.test(line));
+}
+
+function isCodeFence(line: string): boolean {
+  return CODE_FENCE.test(line.trim());
+}
+
+function collapseBlankLines(lines: readonly string[]): string[] {
+  const compact = lines.filter((line, index) => {
+    if (line !== "") return true;
+    const previous = lines[index - 1];
+    return previous !== "";
+  });
+  while (compact[0] === "") compact.shift();
+  while (compact.at(-1) === "") compact.pop();
+  return compact;
+}
+
+function appendBlankSummaryLine(summary: string[]): void {
+  summary.push("");
+}
+
+function appendContentSummaryLine(summary: string[], line: string, plainLines: number): number {
+  if (isSummaryLine(line)) {
+    summary.push(line);
+    return 0;
+  }
+  if (plainLines < MAX_PLAIN_SUMMARY_LINES) {
+    summary.push(line);
+    return plainLines + 1;
+  }
+  return plainLines;
+}
+
+function buildCompactSummary(output: string): string {
+  const summary: string[] = [];
+  let inCodeBlock = false;
+  let omittedCode = false;
+  let plainLines = 0;
+  for (const rawLine of output.split("\n")) {
+    const line = rawLine.trimEnd();
+    if (isCodeFence(line)) {
+      inCodeBlock = !inCodeBlock;
+      omittedCode = true;
+      plainLines = 0;
+      continue;
+    }
+    if (inCodeBlock) {
+      omittedCode = true;
+      continue;
+    }
+    if (line.trim().length === 0) {
+      appendBlankSummaryLine(summary);
+      plainLines = 0;
+      continue;
+    }
+    plainLines = appendContentSummaryLine(summary, line, plainLines);
+  }
+  const compact = collapseBlankLines(summary);
+  if (omittedCode) compact.push("", SUMMARY_OMISSION_NOTE);
+  return compact.join("\n").trim() || output;
+}
+
+export function normalizeSpawnAgentOutput(output: string, state: OutputGovernorState | undefined): string {
+  if (!state?.active) {
+    return output;
+  }
+  return governToolOutput("spawn_agent", buildCompactSummary(output), state);
 }
 
 function updateProgress(
@@ -93,13 +175,14 @@ async function runAgent(
   ctx: PluginInput,
   task: AgentTask,
   toolCtx: ExtendedContext,
+  governorState: OutputGovernorState | undefined,
   progressState?: { completed: number; total: number; startTime: number },
 ): Promise<string> {
   const agentStartTime = Date.now();
   updateProgress(toolCtx, progressState, `Running ${task.agent}...`);
 
   try {
-    const agentOutput = await executeAgentSession(ctx, task);
+    const agentOutput = normalizeSpawnAgentOutput(await executeAgentSession(ctx, task), governorState);
     const agentTime = ((Date.now() - agentStartTime) / MS_PER_SECOND).toFixed(1);
     return `## ${task.description} (${agentTime}s)\n\n**Agent**: ${task.agent}\n\n### Result\n\n${agentOutput}`;
   } catch (error) {
@@ -108,14 +191,19 @@ async function runAgent(
   }
 }
 
-async function runParallelAgents(ctx: PluginInput, agents: AgentTask[], extCtx: ExtendedContext): Promise<string> {
+async function runParallelAgents(
+  ctx: PluginInput,
+  agents: AgentTask[],
+  extCtx: ExtendedContext,
+  governorState: OutputGovernorState | undefined,
+): Promise<string> {
   const startTime = Date.now();
   const progressState = { completed: 0, total: agents.length, startTime };
 
   extCtx.metadata?.({ title: `Running ${agents.length} agents in parallel...` });
 
   const runWithProgress = async (task: AgentTask): Promise<string> => {
-    const agentOutput = await runAgent(ctx, task, extCtx, progressState);
+    const agentOutput = await runAgent(ctx, task, extCtx, governorState, progressState);
     progressState.completed++;
     const elapsed = ((Date.now() - startTime) / MS_PER_SECOND).toFixed(0);
     extCtx.metadata?.({
@@ -132,7 +220,7 @@ async function runParallelAgents(ctx: PluginInput, agents: AgentTask[], extCtx: 
   return `# ${agents.length} agents completed in ${totalTime}s (parallel)\n\n${results.join("\n\n---\n\n")}`;
 }
 
-export function createSpawnAgentTool(ctx: PluginInput): ToolDefinition {
+export function createSpawnAgentTool(ctx: PluginInput, budget?: ContextBudgetHooks): ToolDefinition {
   return tool({
     description: `Spawn subagents to execute tasks in PARALLEL.
 All agents in the array run concurrently via Promise.all.
@@ -158,15 +246,16 @@ spawn_agent({
     execute: async (args, toolCtx) => {
       const { agents } = args;
       const extCtx = toolCtx as ExtendedContext;
+      const governorState = budget?.getOutputGovernorState(getSessionId(toolCtx));
 
       if (!agents || agents.length === 0) return "## spawn_agent Failed\n\nNo agents specified.";
 
       if (agents.length === 1) {
         extCtx.metadata?.({ title: `Running ${agents[0].agent}...` });
-        return runAgent(ctx, agents[0], extCtx);
+        return runAgent(ctx, agents[0], extCtx, governorState);
       }
 
-      return runParallelAgents(ctx, agents, extCtx);
+      return runParallelAgents(ctx, agents, extCtx, governorState);
     },
   });
 }

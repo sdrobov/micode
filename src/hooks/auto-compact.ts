@@ -6,17 +6,26 @@ import type { PluginInput } from "@opencode-ai/plugin";
 import { config } from "@/utils/config";
 import { extractErrorMessage } from "@/utils/errors";
 import { log } from "@/utils/logger";
-import { getContextLimit } from "@/utils/model-limits";
+import { resolveContextLimit } from "@/utils/model-limits";
+
+import {
+  type ContinuityHookConfig,
+  clearSessionContinuity,
+  formatResumeContinuityPrompt,
+  getContinuityAnchorBudget,
+  getSessionContinuityAnchor,
+  isContinuityAnchorActive,
+  mergeSessionContinuitySummary,
+  updateSessionContinuityProfile,
+} from "./continuity-anchor";
 
 const SESSION_ID_PREFIX_LENGTH = 8;
 const PERCENT_MULTIPLIER = 100;
 const MAX_ERROR_MESSAGE_LENGTH = 100;
 
-export interface AutoCompactConfig {
+export interface AutoCompactConfig extends ContinuityHookConfig {
   /** Compaction threshold (0-1), defaults to config.compaction.threshold */
   compactionThreshold?: number;
-  /** Model context limits loaded from opencode.json */
-  modelContextLimits?: Map<string, number>;
 }
 
 interface PendingCompaction {
@@ -37,7 +46,6 @@ interface AutoCompactHooks {
 
 export function createAutoCompactHook(ctx: PluginInput, hookConfig?: AutoCompactConfig): AutoCompactHooks {
   const threshold = hookConfig?.compactionThreshold ?? config.compaction.threshold;
-  const modelLimits = hookConfig?.modelContextLimits;
 
   const state: AutoCompactState = {
     inProgress: new Set(),
@@ -55,7 +63,7 @@ export function createAutoCompactHook(ctx: PluginInput, hookConfig?: AutoCompact
       }
 
       if (event.type === "message.updated") {
-        await handleMessageUpdated(ctx, state, threshold, modelLimits, props);
+        await handleMessageUpdated(ctx, state, threshold, hookConfig, props);
       }
     },
   };
@@ -67,6 +75,7 @@ function handleSessionDeleted(state: AutoCompactState, props: Record<string, unk
 
   state.inProgress.delete(sessionInfo.id);
   state.lastCompactTime.delete(sessionInfo.id);
+  clearSessionContinuity(sessionInfo.id);
   resolvePendingWithError(state, sessionInfo.id, "Session deleted");
 }
 
@@ -83,32 +92,28 @@ async function handleMessageUpdated(
   ctx: PluginInput,
   state: AutoCompactState,
   threshold: number,
-  modelLimits: Map<string, number> | undefined,
+  hookConfig: AutoCompactConfig | undefined,
   props: Record<string, unknown> | undefined,
 ): Promise<void> {
   const info = props?.info as Record<string, unknown> | undefined;
   const sessionID = info?.sessionID as string | undefined;
-
   if (!sessionID || info?.role !== "assistant") return;
 
-  // Check if this is a summary message - signals compaction complete
+  const modelID = (info?.modelID as string) || "";
+  const providerID = (info?.providerID as string) || "";
+  updateSessionContinuityProfile(sessionID, modelID, providerID, hookConfig);
+
   if (info?.summary === true) {
     resolvePendingAsComplete(state, sessionID);
     return;
   }
 
-  // Skip triggering compaction if we're already waiting for one
   if (state.pendingCompactions.has(sessionID)) return;
 
-  const usageRatio = computeUsageRatio(info, modelLimits);
-  if (usageRatio === null) return;
+  const usageRatio = computeUsageRatio(info, hookConfig);
+  if (usageRatio === null || usageRatio < threshold) return;
 
-  // Trigger compaction if over threshold
-  if (usageRatio >= threshold) {
-    const modelID = (info?.modelID as string) || "";
-    const providerID = (info?.providerID as string) || "";
-    void triggerCompaction(ctx, state, threshold, sessionID, providerID, modelID, usageRatio);
-  }
+  void triggerCompaction(ctx, state, threshold, sessionID, providerID, modelID, usageRatio, hookConfig);
 }
 
 function resolvePendingAsComplete(state: AutoCompactState, sessionID: string): void {
@@ -120,18 +125,26 @@ function resolvePendingAsComplete(state: AutoCompactState, sessionID: string): v
   pending.resolve();
 }
 
-function computeUsageRatio(info: Record<string, unknown>, modelLimits: Map<string, number> | undefined): number | null {
+function computeUsageRatio(info: Record<string, unknown>, hookConfig?: AutoCompactConfig): number | null {
   const tokens = info?.tokens as { input?: number; cache?: { read?: number } } | undefined;
   const inputTokens = tokens?.input || 0;
   const cacheRead = tokens?.cache?.read || 0;
   const totalUsed = inputTokens + cacheRead;
-
   if (totalUsed === 0) return null;
 
   const modelID = (info?.modelID as string) || "";
   const providerID = (info?.providerID as string) || "";
-  const contextLimit = getContextLimit(modelID, providerID, modelLimits);
-  return totalUsed / contextLimit;
+  const resolution = resolveContextLimit({
+    modelID,
+    providerID,
+    modelContextLimits: hookConfig?.modelContextLimits,
+    localContextLimit: hookConfig?.localContextLimit,
+    smallContext: hookConfig?.smallContext,
+  });
+  if (!resolution.resolved || resolution.limit === null) {
+    return null;
+  }
+  return totalUsed / resolution.limit;
 }
 
 function waitForCompaction(state: AutoCompactState, sessionID: string): Promise<void> {
@@ -153,10 +166,10 @@ async function triggerCompaction(
   providerID: string,
   modelID: string,
   usageRatio: number,
+  hookConfig?: AutoCompactConfig,
 ): Promise<void> {
   if (state.inProgress.has(sessionID)) return;
 
-  // Check cooldown
   const lastCompact = state.lastCompactTime.get(sessionID) || 0;
   if (Date.now() - lastCompact < config.compaction.cooldownMs) return;
 
@@ -164,8 +177,6 @@ async function triggerCompaction(
 
   try {
     await showCompactionStartToast(ctx, threshold, usageRatio);
-
-    // Set up listener BEFORE calling summarize to avoid race condition
     const compactionPromise = waitForCompaction(state, sessionID);
 
     await ctx.client.session.summarize({
@@ -177,9 +188,13 @@ async function triggerCompaction(
     await compactionPromise;
     state.lastCompactTime.set(sessionID, Date.now());
 
-    await writeSummaryToLedger(ctx, sessionID);
+    const summaryText = await writeSummaryToLedger(ctx, sessionID);
+    if (summaryText) {
+      mergeSessionContinuitySummary(sessionID, summaryText, getContinuityAnchorBudget(hookConfig));
+    }
+
     await showCompactionSuccessToast(ctx);
-    await autoContinueAfterCompaction(ctx, sessionID, providerID, modelID);
+    await autoContinueAfterCompaction(ctx, sessionID, providerID, modelID, hookConfig);
   } catch (e) {
     await showCompactionErrorToast(ctx, e);
   } finally {
@@ -220,13 +235,13 @@ async function showCompactionSuccessToast(ctx: PluginInput): Promise<void> {
     });
 }
 
-async function showCompactionErrorToast(ctx: PluginInput, e: unknown): Promise<void> {
-  const errorMsg = extractErrorMessage(e);
+async function showCompactionErrorToast(ctx: PluginInput, error: unknown): Promise<void> {
+  const errorMessage = extractErrorMessage(error);
   await ctx.client.tui
     .showToast({
       body: {
         title: "Compaction Failed",
-        message: errorMsg.slice(0, MAX_ERROR_MESSAGE_LENGTH),
+        message: errorMessage.slice(0, MAX_ERROR_MESSAGE_LENGTH),
         variant: "error",
         duration: config.timeouts.toastErrorMs,
       },
@@ -236,22 +251,33 @@ async function showCompactionErrorToast(ctx: PluginInput, e: unknown): Promise<v
     });
 }
 
+function buildAutoContinuePrompt(sessionID: string, hookConfig?: AutoCompactConfig): string {
+  if (!isContinuityAnchorActive(sessionID)) {
+    return "Context was compacted. Continue from where you left off. Check the summary above first.";
+  }
+
+  return formatResumeContinuityPrompt(
+    sessionID,
+    getSessionContinuityAnchor(sessionID),
+    getContinuityAnchorBudget(hookConfig),
+    "Context was compacted. Resume from this continuity anchor.",
+  );
+}
+
 async function autoContinueAfterCompaction(
   ctx: PluginInput,
   sessionID: string,
   providerID: string,
   modelID: string,
+  hookConfig?: AutoCompactConfig,
 ): Promise<void> {
+  const text = buildAutoContinuePrompt(sessionID, hookConfig);
+
   await ctx.client.session
     .prompt({
       path: { id: sessionID },
       body: {
-        parts: [
-          {
-            type: "text",
-            text: "Context was compacted. Continue from where you left off - check the 'In Progress' and 'Next Steps' sections in the summary above.",
-          },
-        ],
+        parts: [{ type: "text", text }],
         model: { providerID, modelID },
       },
       query: { directory: ctx.directory },
@@ -261,7 +287,7 @@ async function autoContinueAfterCompaction(
     });
 }
 
-async function writeSummaryToLedger(ctx: PluginInput, sessionID: string): Promise<void> {
+async function writeSummaryToLedger(ctx: PluginInput, sessionID: string): Promise<string | null> {
   try {
     const resp = await ctx.client.session.messages({
       path: { id: sessionID },
@@ -269,7 +295,7 @@ async function writeSummaryToLedger(ctx: PluginInput, sessionID: string): Promis
     });
 
     const summaryText = extractSummaryText(resp);
-    if (!summaryText) return;
+    if (!summaryText) return null;
 
     const ledgerDir = join(ctx.directory, config.paths.ledgerDir);
     await mkdir(ledgerDir, { recursive: true });
@@ -277,7 +303,6 @@ async function writeSummaryToLedger(ctx: PluginInput, sessionID: string): Promis
     const timestamp = new Date().toISOString();
     const sessionName = sessionID.slice(0, SESSION_ID_PREFIX_LENGTH);
     const ledgerPath = join(ledgerDir, `${config.paths.ledgerPrefix}${sessionName}.md`);
-
     const ledgerContent = `---
 session: ${sessionName}
 updated: ${timestamp}
@@ -287,9 +312,10 @@ ${summaryText}
 `;
 
     await writeFile(ledgerPath, ledgerContent, "utf-8");
-  } catch (e) {
-    // Don't fail the compaction flow if ledger write fails
-    log.error("auto-compact", "Failed to write ledger", e);
+    return summaryText;
+  } catch (error) {
+    log.error("auto-compact", "Failed to write ledger", error);
+    return null;
   }
 }
 
@@ -297,20 +323,19 @@ function extractSummaryText(resp: unknown): string | null {
   const messages = (resp as { data?: unknown[] }).data;
   if (!Array.isArray(messages)) return null;
 
-  const summaryMsg = [...messages].reverse().find((m) => {
-    const msg = m as Record<string, unknown>;
-    const info = msg.info as Record<string, unknown> | undefined;
+  const summaryMessage = [...messages].reverse().find((message) => {
+    const entry = message as Record<string, unknown>;
+    const info = entry.info as Record<string, unknown> | undefined;
     return info?.role === "assistant" && info?.summary === true;
   }) as Record<string, unknown> | undefined;
+  if (!summaryMessage) return null;
 
-  if (!summaryMsg) return null;
-
-  const parts = summaryMsg.parts as Array<{ type: string; text?: string }> | undefined;
+  const parts = summaryMessage.parts as Array<{ type: string; text?: string }> | undefined;
   if (!parts) return null;
 
   const text = parts
-    .filter((p) => p.type === "text" && p.text)
-    .map((p) => p.text)
+    .filter((part) => part.type === "text" && part.text)
+    .map((part) => part.text)
     .join("\n\n");
 
   return text.trim() || null;

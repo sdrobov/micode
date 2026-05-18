@@ -52,6 +52,10 @@ categories:
     );
   }
 
+  function writeSystemConstraints(dir: string, content: string) {
+    writeFileSync(join(dir, ".mindmodel", "system.md"), content);
+  }
+
   // Helper to simulate the two-hook flow
   async function runInjectionFlow(
     hook: ReturnType<typeof import("../../src/hooks/mindmodel-injector").createMindmodelInjectorHook>,
@@ -164,5 +168,56 @@ categories:
     expect(system2.length).toBe(2);
     expect(system1[0]).toContain("mindmodel-examples");
     expect(system2[0]).toContain("mindmodel-examples");
+  });
+
+  it("should prioritize constraints over examples in small-context mode", async () => {
+    setupMindmodel(testDir);
+    writeSystemConstraints(testDir, "Prefer factories.\n".repeat(20));
+
+    const { createMindmodelInjectorHook } = await import("../../src/hooks/mindmodel-injector");
+    const { createPromptBudgetController } = await import("../../src/hooks/prompt-budgeting");
+    const { parseSmallContextConfig } = await import("../../src/config-schemas");
+    const ctx = createMockCtx(testDir);
+
+    const smallContext = parseSmallContextConfig({
+      mode: "on",
+      autoThreshold: 320,
+      promptBudgeting: {
+        maxPromptRatio: 0.3,
+        reserveTokens: 20,
+      },
+    });
+    const hook = createMindmodelInjectorHook(ctx as any, {
+      promptBudget: createPromptBudgetController({ smallContext }),
+    });
+
+    const system = await runInjectionFlow(hook, "small-context", [
+      { info: { role: "user" }, parts: [{ type: "text", text: "Add a button component" }] },
+    ]);
+
+    expect(system.some((entry) => entry.includes("mindmodel-constraints"))).toBe(true);
+    expect(system.some((entry) => entry.includes("mindmodel-examples"))).toBe(false);
+  });
+
+  it("should invalidate cached mindmodel content after edits", async () => {
+    setupMindmodel(testDir);
+
+    const { createMindmodelInjectorHook } = await import("../../src/hooks/mindmodel-injector");
+    const ctx = createMockCtx(testDir);
+    const hook = createMindmodelInjectorHook(ctx as any);
+    const buttonPath = join(testDir, ".mindmodel", "components", "button.md");
+
+    const before = await runInjectionFlow(hook, "cache-before", [
+      { info: { role: "user" }, parts: [{ type: "text", text: "Add a button" }] },
+    ]);
+    expect(before[0]).toContain("Click");
+
+    writeFileSync(buttonPath, "# Button\n\nUpdated button example.");
+    await hook["tool.execute.after"]({ tool: "Edit", args: { filePath: buttonPath } }, { output: "" });
+
+    const after = await runInjectionFlow(hook, "cache-after", [
+      { info: { role: "user" }, parts: [{ type: "text", text: "Add a button" }] },
+    ]);
+    expect(after[0]).toContain("Updated button example.");
   });
 });

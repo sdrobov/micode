@@ -1,6 +1,7 @@
 import { describe, expect, it } from "bun:test";
 
 import type { ContextBudgetHooks } from "../../src/hooks/context-budget";
+import { createCheckContextBudgetTool } from "../../src/tools/check-context-budget";
 
 function createMockBudget(overrides?: Partial<ContextBudgetHooks>): ContextBudgetHooks {
   return {
@@ -11,13 +12,41 @@ function createMockBudget(overrides?: Partial<ContextBudgetHooks>): ContextBudge
       files: paths.map((p) => ({ path: p, estimated: 1000, method: "exact" })),
     }),
     canRead: () => ({ decision: "ok", remaining: 50_000, estimatedCost: 1000, availableBudget: 40_000 }),
+    assessFanout: async (sessionID, opts) => {
+      const fileEstimates = (opts.files ?? []).map((path) => ({ path, estimated: 1000, method: "exact" as const }));
+      return {
+        active: false,
+        decision: "direct_ok",
+        reasons: [],
+        estimatedCost: fileEstimates.length * 1000,
+        fileEstimates,
+        readDecision: "ok",
+        fileCount: fileEstimates.length,
+        extrapolatedFileCount: 0,
+        largeFileCount: 0,
+        expectedToolCalls: opts.expectedToolCalls ?? 0,
+        mixedToolCount: opts.plannedTools?.length ?? 0,
+        remaining: sessionID === "s1" ? 50_000 : 40_000,
+        availableBudget: 40_000,
+      };
+    },
     getBudget: () => ({ used: 10_000, limit: 50_000, remaining: 40_000 }),
+    getOutputGovernorState: () => ({
+      active: false,
+      reason: "disabled",
+      mode: "off",
+      used: 10_000,
+      limit: 50_000,
+      remaining: 40_000,
+      reserveTokens: 0,
+      availableTokens: 40_000,
+      charPerToken: 2,
+    }),
     ...overrides,
   };
 }
 
 describe("check-context-budget tool", () => {
-  // Only test the logic since the actual tool API is complex to construct in tests
   describe("execution logic", () => {
     it("should return ok for files within budget", async () => {
       const budget = createMockBudget({
@@ -51,6 +80,44 @@ describe("check-context-budget tool", () => {
       expect(state?.used).toBe(10_000);
       expect(state?.limit).toBe(50_000);
       expect(state?.remaining).toBe(40_000);
+    });
+  });
+
+  describe("tool output", () => {
+    it("should include proactive fanout guidance for broad investigations", async () => {
+      const budget = createMockBudget({
+        assessFanout: async (_sessionID, opts) => ({
+          active: true,
+          decision: "fanout_recommended",
+          reasons: ["investigation spans 4 files", "3 tool types are mixed in one investigation"],
+          estimatedCost: 4_000,
+          fileEstimates: (opts.files ?? []).map((path) => ({ path, estimated: 1000, method: "exact" as const })),
+          readDecision: "ok",
+          fileCount: opts.files?.length ?? 0,
+          extrapolatedFileCount: 0,
+          largeFileCount: 0,
+          expectedToolCalls: opts.expectedToolCalls ?? 0,
+          mixedToolCount: opts.plannedTools?.length ?? 0,
+          remaining: 40_000,
+          availableBudget: 30_000,
+        }),
+      });
+      const tool = createCheckContextBudgetTool(budget).check_context_budget;
+      const result = await tool.execute(
+        {
+          files: ["a.ts", "b.ts", "c.ts", "d.ts"],
+          expectedToolCalls: 5,
+          plannedTools: ["Glob", "Grep", "Read"],
+          investigationType: "broad_exploration",
+        },
+        { sessionID: "s1" },
+      );
+      const parsed = JSON.parse(result);
+
+      expect(parsed.result.decision).toBe("ok");
+      expect(parsed.result.fanoutDecision).toBe("fanout_recommended");
+      expect(parsed.fanout.active).toBe(true);
+      expect(parsed.recommendation).toContain("Prefer summary fanout");
     });
   });
 });
