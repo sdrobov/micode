@@ -1,6 +1,12 @@
-import { describe, expect, it } from "bun:test";
+import { beforeEach, describe, expect, it } from "bun:test";
 
 import { parseSmallContextConfig } from "../../src/config-schemas";
+import {
+  activateOverflowRecovery,
+  OVERFLOW_RECOVERY_SOURCES,
+  OVERFLOW_RECOVERY_STAGES,
+  resetOverflowRecoveryState,
+} from "../../src/hooks/overflow-recovery-state";
 import {
   createPromptBudgetController,
   selectPromptBudgetEntries,
@@ -8,6 +14,10 @@ import {
 } from "../../src/hooks/prompt-budgeting";
 
 describe("prompt-budgeting", () => {
+  beforeEach(() => {
+    resetOverflowRecoveryState();
+  });
+
   it("should use the small-context threshold when mode is forced on", () => {
     const smallContext = parseSmallContextConfig({
       mode: "on",
@@ -91,6 +101,26 @@ describe("prompt-budgeting", () => {
     const controller = createPromptBudgetController({ smallContext });
 
     expect(controller.getRemainingTokens({ existingText: "A".repeat(100), sessionID: "session-override" })).toBe(625);
+  });
+
+  it("should tighten prompt headroom during overflow recovery even for unknown models", () => {
+    const smallContext = parseSmallContextConfig({
+      mode: "auto",
+      autoThreshold: 2_000,
+      promptBudgeting: {
+        maxPromptRatio: 0.5,
+        reserveTokens: 100,
+      },
+    });
+    const controller = createPromptBudgetController({ smallContext });
+
+    activateOverflowRecovery(
+      "overflow-session",
+      OVERFLOW_RECOVERY_SOURCES.SESSION_RECOVERY,
+      OVERFLOW_RECOVERY_STAGES.STRICT,
+    );
+
+    expect(controller.getRemainingTokens({ sessionID: "overflow-session" })).toBe(500);
   });
 
   it("should dedupe entries and truncate the final fit", () => {

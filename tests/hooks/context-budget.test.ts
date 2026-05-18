@@ -2,6 +2,12 @@ import { afterEach, describe, expect, it } from "bun:test";
 
 import type { ContextBudgetHooks } from "../../src/hooks/context-budget";
 import { createContextBudgetHook } from "../../src/hooks/context-budget";
+import {
+  activateOverflowRecovery,
+  OVERFLOW_RECOVERY_SOURCES,
+  OVERFLOW_RECOVERY_STAGES,
+  resetOverflowRecoveryState,
+} from "../../src/hooks/overflow-recovery-state";
 
 function createMockCtx() {
   return {
@@ -14,6 +20,7 @@ describe("context-budget", () => {
 
   afterEach(() => {
     hook = null as unknown as ContextBudgetHooks;
+    resetOverflowRecoveryState();
   });
 
   describe("createContextBudgetHook", () => {
@@ -202,6 +209,32 @@ describe("context-budget", () => {
       expect(state.active).toBe(true);
       expect(state.availableTokens).toBe(10_000);
       expect(state.reason).toBe("active");
+    });
+
+    it("should tighten output headroom during overflow recovery", () => {
+      hook = createContextBudgetHook(createMockCtx(), {
+        defaultContextLimit: 12_000,
+        charPerToken: 1,
+        smallContext: {
+          mode: "auto",
+          autoThreshold: 96_000,
+          continuityAnchor: { enabled: true, budgetTokens: 900 },
+          outputGovernor: { enabled: true, reserveTokens: 2_000 },
+          promptBudgeting: { enabled: true, maxPromptRatio: 0.5, reserveTokens: 4_000 },
+        },
+      });
+
+      activateOverflowRecovery(
+        "session-overflow",
+        OVERFLOW_RECOVERY_SOURCES.SESSION_RECOVERY,
+        OVERFLOW_RECOVERY_STAGES.MINIMAL,
+      );
+
+      const state = hook.getOutputGovernorState("session-overflow");
+
+      expect(state.active).toBe(true);
+      expect(state.reserveTokens).toBeGreaterThan(2_000);
+      expect(state.availableTokens).toBeLessThan(10_000);
     });
 
     it("should auto-activate for known small-context models", async () => {
@@ -427,6 +460,35 @@ describe("context-budget", () => {
 
       expect(result.decision).toBe("fanout_required");
       expect(result.reasons).toContain("this is the first broad investigation after compaction or resume");
+    });
+
+    it("should require fanout more aggressively during overflow recovery", async () => {
+      hook = createContextBudgetHook(createMockCtx(), {
+        defaultContextLimit: 32_000,
+        smallContext: {
+          mode: "on",
+          autoThreshold: 96_000,
+          continuityAnchor: { enabled: true, budgetTokens: 900 },
+          outputGovernor: { enabled: true, reserveTokens: 2_000 },
+          promptBudgeting: { enabled: true, maxPromptRatio: 0.5, reserveTokens: 4_000 },
+        },
+      });
+
+      activateOverflowRecovery(
+        "session-overflow",
+        OVERFLOW_RECOVERY_SOURCES.CONTEXT_BUDGET,
+        OVERFLOW_RECOVERY_STAGES.STRICT,
+      );
+
+      const result = await hook.assessFanout("session-overflow", {
+        files: ["a.ts", "b.ts"],
+        expectedToolCalls: 2,
+        plannedTools: ["Read", "Glob"],
+        investigationType: "broad_exploration",
+      });
+
+      expect(result.decision).toBe("fanout_required");
+      expect(result.reasons.some((reason) => reason.includes("overflow recovery"))).toBe(true);
     });
   });
 });

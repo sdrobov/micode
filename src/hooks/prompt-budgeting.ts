@@ -1,4 +1,5 @@
 import type { SmallContextConfig } from "@/config-schemas";
+import { getOverflowRecoveryState } from "@/hooks/overflow-recovery-state";
 import { config } from "@/utils/config";
 import { resolveContextLimit } from "@/utils/model-limits";
 
@@ -49,6 +50,22 @@ export interface PromptBudgetController {
 interface OrderedPromptBudgetEntry<T> extends PromptBudgetEntry<T> {
   readonly index: number;
   readonly priority: number;
+}
+
+interface PromptOverflowProfile {
+  readonly maxPromptMultiplier: number;
+  readonly reserveMultiplier: number;
+}
+
+const PROMPT_OVERFLOW_PROFILES: Record<string, PromptOverflowProfile> = {
+  normal: { maxPromptMultiplier: 1, reserveMultiplier: 1 },
+  reduced: { maxPromptMultiplier: 0.85, reserveMultiplier: 1.25 },
+  strict: { maxPromptMultiplier: 0.65, reserveMultiplier: 1.5 },
+  minimal: { maxPromptMultiplier: 0.5, reserveMultiplier: 2 },
+};
+
+function getPromptOverflowProfile(stage: string): PromptOverflowProfile {
+  return PROMPT_OVERFLOW_PROFILES[stage] ?? PROMPT_OVERFLOW_PROFILES.normal;
 }
 
 export function estimatePromptTokens(text: string): number {
@@ -108,9 +125,14 @@ function resolvePromptBudgetContextLimit(
     localContextLimit: hookConfig?.localContextLimit,
     smallContext,
   });
+  const overflowRecovery = getOverflowRecoveryState(request.sessionID ?? "");
 
   if (smallContext.mode === "on") {
     return resolution.limit ?? smallContext.autoThreshold;
+  }
+
+  if (overflowRecovery.active) {
+    return Math.min(resolution.limit ?? smallContext.autoThreshold, smallContext.autoThreshold);
   }
 
   if (!resolution.resolved || resolution.limit === null) return null;
@@ -122,9 +144,14 @@ function calculateRemainingTokens(
   request: PromptBudgetRequest,
   contextLimit: number,
   smallContext: SmallContextConfig,
+  overflowRecovery = getOverflowRecoveryState(request.sessionID ?? ""),
 ): number {
-  const maxPromptTokens = Math.floor(contextLimit * smallContext.promptBudgeting.maxPromptRatio);
-  const budgetCap = Math.max(0, maxPromptTokens - smallContext.promptBudgeting.reserveTokens);
+  const profile = getPromptOverflowProfile(overflowRecovery.stage);
+  const maxPromptTokens = Math.floor(
+    contextLimit * smallContext.promptBudgeting.maxPromptRatio * profile.maxPromptMultiplier,
+  );
+  const reserveTokens = Math.ceil(smallContext.promptBudgeting.reserveTokens * profile.reserveMultiplier);
+  const budgetCap = Math.max(0, maxPromptTokens - reserveTokens);
   const existingTokens = estimatePromptTokens(joinExistingText(request.existingText));
   return Math.max(0, budgetCap - existingTokens);
 }

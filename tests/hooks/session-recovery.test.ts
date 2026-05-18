@@ -6,6 +6,13 @@ import {
   resetContinuityRegistry,
   updateSessionContinuityProfile,
 } from "../../src/hooks/continuity-anchor";
+import {
+  activateOverflowRecovery,
+  getOverflowRecoveryState,
+  OVERFLOW_RECOVERY_SOURCES,
+  OVERFLOW_RECOVERY_STAGES,
+  resetOverflowRecoveryState,
+} from "../../src/hooks/overflow-recovery-state";
 import { createSessionRecoveryHook } from "../../src/hooks/session-recovery";
 
 const SMALL_CONTEXT_CONFIG: ContinuityHookConfig = {
@@ -32,6 +39,7 @@ const SMALL_CONTEXT_CONFIG: ContinuityHookConfig = {
 describe("session-recovery", () => {
   beforeEach(() => {
     resetContinuityRegistry();
+    resetOverflowRecoveryState();
   });
 
   function createMockCtx(overrides?: Record<string, unknown>) {
@@ -270,6 +278,100 @@ describe("session-recovery", () => {
       await new Promise((resolve) => setTimeout(resolve, 600));
       expect(toastMessages.some((m) => m.includes("empty content"))).toBe(true);
     });
+
+    it("should recover context overflow from preserved continuity state", async () => {
+      const promptTexts: string[] = [];
+      const ctx = createMockCtx({
+        client: {
+          session: {
+            abort: async () => {},
+            messages: async () => ({
+              data: [
+                {
+                  info: { role: "assistant", summary: true },
+                  parts: [
+                    {
+                      type: "text",
+                      text: `# Session Summary
+
+## Goal
+Preserve overflow continuity
+
+## Progress
+### In Progress
+- [ ] Wrong summary step
+
+## Next Steps
+1. Replace the accepted plan`,
+                    },
+                  ],
+                },
+              ],
+            }),
+            prompt: async ({ body }: { body: { parts: Array<{ text: string }> } }) => {
+              promptTexts.push(body.parts[0].text);
+            },
+          },
+          tui: { showToast: async () => {} },
+        },
+      });
+
+      mergeSessionContinuityAnchor("s-overflow", {
+        goal: "Preserve overflow continuity",
+        acceptedPlan: "Keep the accepted plan",
+        currentStep: "Resume the preserved step",
+      });
+
+      const hook = createSessionRecoveryHook(ctx);
+
+      await hook.event({
+        event: {
+          type: "session.error",
+          properties: {
+            sessionID: "s-overflow",
+            error: "Context size has been exceeded.",
+          },
+        },
+      });
+
+      await new Promise((resolve) => setTimeout(resolve, 600));
+      expect(promptTexts).toHaveLength(1);
+      expect(promptTexts[0]).toContain("Context overflowed. Resume from this continuity anchor.");
+      expect(promptTexts[0]).toContain("Accepted plan: Keep the accepted plan");
+      expect(promptTexts[0]).toContain("Current step: Resume the preserved step");
+      expect(getOverflowRecoveryState("s-overflow").active).toBe(true);
+      expect(getOverflowRecoveryState("s-overflow").lastSource).toBe(OVERFLOW_RECOVERY_SOURCES.SESSION_RECOVERY);
+    });
+
+    it("should advance overflow recovery state for repeated overflow variants", async () => {
+      const ctx = createMockCtx({
+        client: {
+          session: {
+            abort: async () => {},
+            messages: async () => ({ data: [] }),
+            prompt: async () => {},
+          },
+          tui: { showToast: async () => {} },
+        },
+      });
+
+      activateOverflowRecovery("s-overflow", OVERFLOW_RECOVERY_SOURCES.SESSION_RECOVERY);
+      const hook = createSessionRecoveryHook(ctx);
+
+      await hook.event({
+        event: {
+          type: "session.error",
+          properties: {
+            sessionID: "s-overflow",
+            error: "This model's maximum context length is 8192 tokens, but 9000 tokens were requested.",
+          },
+        },
+      });
+
+      await new Promise((resolve) => setTimeout(resolve, 600));
+      expect(getOverflowRecoveryState("s-overflow").stage).toBe(OVERFLOW_RECOVERY_STAGES.STRICT);
+      expect(getOverflowRecoveryState("s-overflow").overflowCount).toBe(2);
+    });
   });
 
   describe("message.updated event with error", () => {
@@ -391,26 +493,37 @@ Preserve continuity
       expect(promptTexts[0]).toContain("Accepted plan: Keep ledger-loader clean first");
       expect(promptTexts[0]).toContain("Current step: Resume session recovery");
     });
+
+    it("should deactivate overflow recovery after a successful assistant update", async () => {
+      const hook = createSessionRecoveryHook(createMockCtx());
+
+      activateOverflowRecovery("s1", OVERFLOW_RECOVERY_SOURCES.SESSION_RECOVERY);
+
+      await hook.event({
+        event: {
+          type: "message.updated",
+          properties: {
+            info: {
+              sessionID: "s1",
+              role: "assistant",
+              providerID: "openai",
+              modelID: "gpt-4o",
+            },
+          },
+        },
+      });
+
+      expect(getOverflowRecoveryState("s1").active).toBe(false);
+      expect(getOverflowRecoveryState("s1").stage).toBe(OVERFLOW_RECOVERY_STAGES.REDUCED);
+    });
   });
 
   describe("session.deleted event", () => {
     it("should clean up recovery state for deleted session", async () => {
       const hook = createSessionRecoveryHook(createMockCtx());
 
-      // Trigger a recovery to set up state
-      await hook.event({
-        event: {
-          type: "session.error",
-          properties: {
-            sessionID: "s1",
-            error: "content cannot be empty",
-          },
-        },
-      });
+      activateOverflowRecovery("s1", OVERFLOW_RECOVERY_SOURCES.SESSION_RECOVERY);
 
-      await new Promise((resolve) => setTimeout(resolve, 600));
-
-      // Delete the session
       await hook.event({
         event: {
           type: "session.deleted",
@@ -418,7 +531,13 @@ Preserve continuity
         },
       });
 
-      // Should not throw or cause issues
+      expect(getOverflowRecoveryState("s1")).toEqual({
+        active: false,
+        stage: OVERFLOW_RECOVERY_STAGES.NORMAL,
+        overflowCount: 0,
+        lastSource: null,
+        lastOverflowAt: null,
+      });
     });
 
     it("should handle missing session info on deletion", async () => {

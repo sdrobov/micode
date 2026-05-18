@@ -54,6 +54,20 @@ export {
 export { createMindmodelInjectorHook } from "./mindmodel-injector";
 export { createOutputGovernorHook, type OutputGovernorHooks } from "./output-governor";
 export {
+  activateOverflowRecovery,
+  clearOverflowRecoverySession,
+  deactivateOverflowRecovery,
+  escalateOverflowRecovery,
+  getOverflowRecoveryState,
+  isOverflowRecoveryActive,
+  OVERFLOW_RECOVERY_SOURCES,
+  OVERFLOW_RECOVERY_STAGES,
+  type OverflowRecoverySource,
+  type OverflowRecoveryStage,
+  type OverflowRecoveryState,
+  resetOverflowRecoveryState,
+} from "./overflow-recovery-state";
+export {
   createPromptBudgetController,
   estimatePromptTokens,
   type PromptBudgetController,
